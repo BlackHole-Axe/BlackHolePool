@@ -63,6 +63,10 @@ pub struct Config {
     pub notify_bucket_refill_ms: f64,
     /// Minimum ms between ZMQ-triggered template refreshes (debounce duplicate topics).
     pub zmq_debounce_ms: u64,
+    /// After a new block (hashblock ZMQ), suppress TX-triggered GBT refreshes for this many ms.
+    /// Prevents hammering bitcoind during the mempool refill burst after each block.
+    /// After the window expires, ONE refresh captures all accumulated high-fee txs.
+    pub post_block_suppress_ms: u64,
     pub auth_token: Option<String>,
     pub redis_url: Option<String>,
     pub database_url: Option<String>,
@@ -190,6 +194,10 @@ impl Config {
             .unwrap_or_else(|_| "250".to_string())
             .parse()
             .context("ZMQ_DEBOUNCE_MS must be a number")?;
+        let post_block_suppress_ms = env::var("POST_BLOCK_SUPPRESS_MS")
+            .unwrap_or_else(|_| "15000".to_string())
+            .parse()
+            .context("POST_BLOCK_SUPPRESS_MS must be a number")?;
 
         let auth_token = env::var("AUTH_TOKEN")
             .ok()
@@ -239,6 +247,7 @@ impl Config {
             notify_bucket_capacity,
             notify_bucket_refill_ms,
             zmq_debounce_ms,
+            post_block_suppress_ms,
             auth_token,
             redis_url,
             database_url,

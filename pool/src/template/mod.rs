@@ -215,11 +215,10 @@ impl TemplateEngine {
     /// Separation from TX debounce is intentional: a flood of hashtx notifications
     /// CANNOT delay or suppress a new-block template refresh.
     fn should_fire_block_zmq_trigger(&self) -> bool {
-        const BLOCK_DEBOUNCE_MS: u64 = 100;
-        /// After a new block, suppress TX-triggered GBT refreshes for this long.
-        /// Mempool refills rapidly after a block; 15 s batches all those txns into
-        /// one GBT call instead of dozens.
-        const POST_BLOCK_SUPPRESS_MS: u64 = 15_000;
+        // 10ms coalesces hashblock+rawblock arriving simultaneously on dual ZMQ sockets
+        // while minimising the stale window. With dual endpoints (28334+28332), both
+        // topics fire within ~1ms of each other — 10ms is enough to deduplicate them.
+        const BLOCK_DEBOUNCE_MS: u64 = 10;
 
         let now = Self::now_ms();
         let last = self.last_zmq_block_trigger_ms.load(Ordering::Relaxed);
@@ -228,7 +227,8 @@ impl TemplateEngine {
         }
         self.last_zmq_block_trigger_ms.store(now, Ordering::Relaxed);
         // Arm the TX suppression window so the post-block mempool burst is batched.
-        self.post_block_suppress_until_ms.store(now + POST_BLOCK_SUPPRESS_MS, Ordering::Relaxed);
+        let suppress_ms = self.config.post_block_suppress_ms;
+        self.post_block_suppress_until_ms.store(now + suppress_ms, Ordering::Relaxed);
         true
     }
 
@@ -534,10 +534,44 @@ impl TemplateEngine {
                     // The sequence frame was added in Bitcoin Core 0.13 and is always the last
                     // element. If we don't drain it, the next recv will get misaligned.
                     // See: https://raw.githubusercontent.com/bitcoin/bitcoin/master/doc/zmq.md
-                    if socket.recv_msg(0).is_err() || socket.recv_msg(0).is_err() {
-                        warn!("ZMQ block recv failed; reconnecting");
+
+                    // Read the topic frame first so we know what arrived.
+                    let topic_msg = match socket.recv_msg(0) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!("ZMQ block recv failed (topic frame): {e:?}; reconnecting");
+                            break;
+                        }
+                    };
+
+                    // Identify whether this is a block notification BEFORE reading more frames.
+                    // This way, even if the connection drops mid-message, we can still fire
+                    // a template refresh — preventing a missed block during ZMQ instability.
+                    let is_block = topic_msg
+                        .as_str()
+                        .map_or(false, |t| t == "hashblock" || t == "rawblock");
+
+                    // Read the body frame.
+                    if socket.recv_msg(0).is_err() {
+                        // Connection dropped between topic and body.
+                        // If it was a block topic, fire immediately before reconnecting
+                        // so we don't miss the block notification.
+                        if is_block {
+                            warn!("ZMQ block body recv failed — firing refresh before reconnect to avoid missed block");
+                            let engine = engine.clone();
+                            engine.counters.inc_zmq_block_received();
+                            if engine.should_fire_block_zmq_trigger() {
+                                engine.counters.inc_zmq_blocks_detected();
+                                tokio::spawn(async move {
+                                    let _ = engine.refresh_template().await;
+                                });
+                            }
+                        } else {
+                            warn!("ZMQ block recv failed (body frame); reconnecting");
+                        }
                         break;
                     }
+
                     // Drain optional extra frames (sequence number) for compatibility.
                     while socket.get_rcvmore().unwrap_or(false) {
                         if socket.recv_msg(0).is_err() {
@@ -545,15 +579,23 @@ impl TemplateEngine {
                             break;
                         }
                     }
-                    let engine = engine.clone();
-                    engine.counters.inc_zmq_block_received();
-                    if engine.should_fire_block_zmq_trigger() {
-                        tokio::spawn(async move {
-                            let _ = engine.refresh_template().await;
-                        });
+
+                    if is_block {
+                        let engine = engine.clone();
+                        engine.counters.inc_zmq_block_received();
+                        if engine.should_fire_block_zmq_trigger() {
+                            // A unique new block passed the debounce — count it once.
+                            engine.counters.inc_zmq_blocks_detected();
+                            tokio::spawn(async move {
+                                let _ = engine.refresh_template().await;
+                            });
+                        }
                     }
+                    // Non-block topics (e.g. stray subscriptions) are silently drained.
                 }
 
+                // Brief pause before reconnecting to avoid hammering Bitcoin Core.
+                warn!("ZMQ block socket lost — reconnecting in 1s (longpoll fallback is active)");
                 std::thread::sleep(Duration::from_secs(1));
             }
         })
@@ -685,7 +727,7 @@ impl TemplateEngine {
             *guard = Some(lpid.clone());
         }
 
-        let mut key_guard = self.last_template_key.lock().await;
+        let key_guard = self.last_template_key.lock().await;
         if key_guard.as_deref() == Some(&key) {
             // Same content seen before: two sources raced for the same template.
             self.counters.inc_notify_deduped();
@@ -904,9 +946,25 @@ impl TemplateEngine {
         };
 
         let mut script_sig = Vec::new();
-        let height_bytes = encode_script_num(height as i64);
-        script_sig.push(height_bytes.len() as u8);
-        script_sig.extend_from_slice(&height_bytes);
+        // BIP34: push the block height as a minimally-encoded CScript integer.
+        // Bitcoin Core's CScript::push_int64 encoding rules (from script.h):
+        //   n == 0        → OP_0     = 0x00
+        //   1 ≤ n ≤ 16   → OP_n     = 0x51 + (n-1)  [single-byte opcode]
+        //   otherwise     → OP_PUSH(len) + encode_script_num(n)
+        //
+        // On mainnet height > 16 is always true so only the third branch ever
+        // fires in production.  The first two branches are needed for regtest
+        // where the first mined block is at height 1.
+        let height_i64 = height as i64;
+        if height_i64 == 0 {
+            script_sig.push(0x00); // OP_0
+        } else if height_i64 >= 1 && height_i64 <= 16 {
+            script_sig.push(0x50 + height_i64 as u8); // OP_1 (0x51) … OP_16 (0x60)
+        } else {
+            let height_bytes = encode_script_num(height_i64);
+            script_sig.push(height_bytes.len() as u8);
+            script_sig.extend_from_slice(&height_bytes);
+        }
 
         if let Some(flags_hex) = coinbase_flags {
             let flags = hex::decode(flags_hex).context("decode coinbaseaux flags")?;
@@ -1129,6 +1187,12 @@ fn categorise_reject_reason(reason: &str) -> &'static str {
     else if reason.contains("prevblk")   { "stale"      }
     else if reason.contains("diffbits")  { "difficulty" }
     else                                 { "unknown"    }
+}
+
+/// Public re-export for tests — see `build_merkle_branches`.
+#[cfg(test)]
+pub fn build_merkle_branches_pub(coinbase_hash: [u8; 32], tx_hashes: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    build_merkle_branches(coinbase_hash, tx_hashes)
 }
 
 /// Build Stratum merkle branches for the coinbase path.

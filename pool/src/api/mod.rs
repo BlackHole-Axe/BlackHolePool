@@ -209,14 +209,21 @@ struct PoolInfo {
     stalesNewBlock: u64,
     stalesExpired: u64,
     stalesReconnect: u64,
-    // ZMQ activity
-    zmqBlockReceived: u64,
+    // ── ZMQ block activity ───────────────────────────────────────────────
+    /// Unique blocks detected via ZMQ (after 10ms debounce).
+    /// This is the real block count — always 1 per new block regardless of
+    /// how many ZMQ ports fired (hashblock:28334 + rawblock:28332 = 2 msgs/block).
+    zmqBlocksDetected: u64,
+    /// Raw ZMQ block notifications received across ALL endpoints.
+    /// With dual ZMQ ports (28334 + 28332), this is ~2× zmqBlocksDetected.
+    /// Example: 1 block → zmqBlocksDetected=1, zmqBlockNotifications=2.
+    zmqBlockNotifications: u64,
+    // ── ZMQ TX activity ──────────────────────────────────────────────────
     zmqTxTriggered: u64,
     /// Suppressed by ZMQ_DEBOUNCE_MS (normal; always high — thousands/hour is fine).
     zmqTxDebounced: u64,
-    /// Suppressed by post-block 15s window.
-    /// Should correlate with zmqBlockReceived: ~N per block × mempool burst rate.
-    /// If this is non-zero WITHOUT zmqBlockReceived growing → investigate.
+    /// Suppressed by post-block suppression window (POST_BLOCK_SUPPRESS_MS).
+    /// Should correlate with zmqBlocksDetected: ~N per block × mempool burst rate.
     zmqTxPostBlockSuppressed: u64,
     /// staleRatio = (stalesNewBlock + stalesExpired + stalesReconnect)
     ///            / (accepted_shares + stale_shares)
@@ -296,7 +303,8 @@ async fn pool(State(state): State<ApiState>) -> impl IntoResponse {
         stalesNewBlock:       c.stales_new_block(),
         stalesExpired:        c.stales_expired(),
         stalesReconnect:      c.stales_reconnect(),
-        zmqBlockReceived:          c.zmq_block_received(),
+        zmqBlocksDetected:         c.zmq_blocks_detected(),
+        zmqBlockNotifications:     c.zmq_block_received(),
         zmqTxTriggered:            c.zmq_tx_triggered(),
         zmqTxDebounced:            c.zmq_tx_debounced(),
         zmqTxPostBlockSuppressed:  c.zmq_tx_post_block_suppressed(),

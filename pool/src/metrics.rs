@@ -125,8 +125,14 @@ pub struct PoolCounters {
     pub zmq_tx_post_block_suppressed: AtomicU64,
     /// ZMQ TX notifications that triggered a GBT refresh.
     pub zmq_tx_triggered:            AtomicU64,
-    /// ZMQ block notifications received.
+    /// ZMQ block notifications received (raw count across ALL endpoints).
+    /// With dual ZMQ (hashblock:28334 + rawblock:28332), this is typically
+    /// 2× the number of actual blocks (each block fires one notification per port).
     pub zmq_block_received:          AtomicU64,
+    /// Unique blocks actually detected via ZMQ (after 10ms debounce).
+    /// This equals the real number of new blocks seen via ZMQ — always 1 per block,
+    /// regardless of how many ZMQ ports fired.
+    pub zmq_blocks_detected:         AtomicU64,
 }
 
 impl PoolCounters {
@@ -147,6 +153,7 @@ impl PoolCounters {
     pub fn zmq_tx_post_block_suppressed(&self) -> u64 { self.zmq_tx_post_block_suppressed.load(Ordering::Relaxed) }
     pub fn zmq_tx_triggered(&self)            -> u64 { self.zmq_tx_triggered.load(Ordering::Relaxed) }
     pub fn zmq_block_received(&self)          -> u64 { self.zmq_block_received.load(Ordering::Relaxed) }
+    pub fn zmq_blocks_detected(&self)         -> u64 { self.zmq_blocks_detected.load(Ordering::Relaxed) }
 
     pub fn inc_jobs_sent(&self, clean: bool) {
         self.jobs_sent.fetch_add(1, Ordering::Relaxed);
@@ -171,6 +178,7 @@ impl PoolCounters {
     pub fn inc_zmq_tx_post_block_suppressed(&self) { self.zmq_tx_post_block_suppressed.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_zmq_tx_triggered(&self)            { self.zmq_tx_triggered.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_zmq_block_received(&self)          { self.zmq_block_received.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_zmq_blocks_detected(&self)         { self.zmq_blocks_detected.fetch_add(1, Ordering::Relaxed); }
 }
 
 #[derive(Default)]

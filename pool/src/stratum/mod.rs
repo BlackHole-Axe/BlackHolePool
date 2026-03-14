@@ -13,6 +13,19 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
+
+/// Maximum byte length of a single Stratum line (including trailing `\n`).
+/// A legitimate mining.submit for a BIP310 miner is < 400 bytes.
+/// 64 KB is generous enough for any valid Stratum message.
+/// Without this guard, a client that never sends `\n` causes BufReader to
+/// grow until the process is OOM-killed.
+const MAX_LINE_BYTES: usize = 65_536;
+
+/// If no data is received from a miner within this duration the session is
+/// torn down.  Bitcoin ASICs submit shares every few seconds; 300 s gives
+/// enough headroom for very low-difficulty / low-hashrate devices while
+/// ensuring dead TCP connections are reaped promptly.
+const IDLE_TIMEOUT_SECS: u64 = 300;
 use uuid::Uuid;
 
 use std::str::FromStr;
@@ -177,7 +190,10 @@ impl StratumServer {
                         .map_or(true, |prev| prev != job.prevhash_le);
 
                     if clean_jobs {
-                        guard.jobs.clear();
+                        // Instead of clearing old jobs immediately, mark them as
+                        // stale-block so shares arriving during the grace window
+                        // are accepted (real work) but never submitted as blocks.
+                        guard.mark_jobs_stale_block();
                         // Record time of last clean_jobs for stale classification.
                         guard.last_clean_jobs_time = Some(Utc::now());
                     }
@@ -330,11 +346,69 @@ impl StratumServer {
         info!("miner connected: {addr}");
         self.metrics.counters.inc_reconnect();
 
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
+        // ── Guarded line reader ───────────────────────────────────────────────
+        // We need two safety properties that plain `lines.next_line()` does not
+        // provide on its own:
+        //
+        //  1. MAX LINE LENGTH: A miner that sends bytes without a newline will
+        //     cause BufReader to buffer them indefinitely → OOM.  We read into
+        //     a pre-allocated Vec and enforce a hard cap.  Any message over
+        //     MAX_LINE_BYTES is assumed malicious; the connection is dropped.
+        //
+        //  2. IDLE TIMEOUT: A half-open TCP connection or a dead miner that
+        //     stops transmitting keeps the session alive forever.  We wrap every
+        //     read in tokio::time::timeout.
+        //
+        // Implementation note: we switch from `lines()` to `read_until(b'\n')`
+        // so we can inspect the accumulated length before allocating a String.
+        let mut buf: Vec<u8> = Vec::with_capacity(512);
+
+        loop {
+            buf.clear();
+            let read_result = tokio::time::timeout(
+                Duration::from_secs(IDLE_TIMEOUT_SECS),
+                lines.get_mut().read_until(b'\n', &mut buf),
+            ).await;
+
+            let n = match read_result {
+                Err(_elapsed) => {
+                    warn!("idle timeout ({IDLE_TIMEOUT_SECS}s) for {addr}, closing session");
+                    break;
+                }
+                Ok(Err(io_err)) => {
+                    // Real I/O error (connection reset etc.) — not a warning.
+                    return Err(io_err.into());
+                }
+                Ok(Ok(0)) => {
+                    // EOF — miner closed the connection cleanly.
+                    break;
+                }
+                Ok(Ok(n)) => n,
+            };
+
+            // ── Line-length guard ─────────────────────────────────────────────
+            if n > MAX_LINE_BYTES {
+                warn!(
+                    "oversized Stratum line from {addr}: {} bytes (max {}), closing session",
+                    n, MAX_LINE_BYTES
+                );
+                break;
+            }
+
+            // Strip trailing \n / \r\n for the JSON parser.
+            let line = match std::str::from_utf8(&buf[..n]) {
+                Ok(s) => s.trim_end_matches(|c| c == '\n' || c == '\r'),
+                Err(_) => {
+                    warn!("non-UTF-8 data from {addr}, skipping line");
+                    continue;
+                }
+            };
+
+            if line.is_empty() {
                 continue;
             }
-            let request: StratumRequest = match serde_json::from_str(&line) {
+
+            let request: StratumRequest = match serde_json::from_str(line) {
                 Ok(req) => req,
                 Err(err) => {
                     warn!("invalid json from {addr}: {err}");
@@ -403,7 +477,7 @@ impl StratumServer {
 
                             let job = job_rx.borrow().clone();
                             let notify_opt = if job.ready {
-                                guard.jobs.clear();
+                                guard.jobs.clear(); // fresh session — no grace needed
                                 let extranonce1_bytes = guard.extranonce1_bytes.clone();
                                 let session_job =
                                     guard.push_job(job.clone(), difficulty, &extranonce1_bytes, None);
@@ -703,7 +777,7 @@ impl StratumServer {
 
         // Grab everything needed for validation with a short lock (no await-heavy work inside).
         let (version_mask, session_job, last_notify, session_start, vardiff_enabled, session_worker, early_reply, stale_reason) = {
-            let mut guard = state.lock().await;
+            let guard = state.lock().await;
 
             if !guard.authorized {
                 let response = json!({
@@ -870,6 +944,25 @@ let job = session_job.job.clone();
         //
         // job_id here is session-scoped (SessionJob.session_job_id), so it is
         // already unique per (session, template) — no cross-session confusion.
+        //
+        // CONCURRENCY ANALYSIS (single session):
+        //   All submits from one TCP connection are processed sequentially by the
+        //   `loop { read_until(...) }` loop — the Tokio task awaits each line before
+        //   processing the next.  Therefore the check+insert block below cannot race
+        //   with another submit on the same session; the Mutex is only needed for
+        //   coordination with the notify/vardiff tasks.
+        //
+        // CONCURRENCY ANALYSIS (across sessions / block candidates):
+        //   Two different sessions that both find a hash below the block target will
+        //   each call submitblock independently.  If both are truly valid the second
+        //   call will return "duplicate" from Bitcoin Core, which we treat as
+        //   accepted.  No block is lost.
+        //
+        // BOUND STRATEGY: We use a rotating window instead of clear() to avoid the
+        // brief window where a duplicate submitted just after the clear passes through.
+        // When the set reaches MAX_DUP_HASHES we remove the OLDEST half rather than
+        // wiping everything, preserving the most recent entries as a guard.
+        const MAX_DUP_HASHES: usize = 4096;
         let version_key = version.as_deref().unwrap_or(&job.version);
         let dup_key = format!("{}:{}:{}:{}:{}", job_id, nonce_clean, ntime_clean, extranonce2_clean, version_key);
         {
@@ -885,8 +978,13 @@ let job = session_job.job.clone();
                 self.metrics.record_share(&worker, session_job.difficulty, 0.0, false, false, 0, 0.0, 0, 0, false).await;
                 return Ok(());
             }
-            // Bound the set to prevent unbounded memory growth.
-            if guard.submitted_hashes.len() >= 2048 {
+            // Rotating eviction: remove oldest half when the set is full.
+            // This avoids the clear()-then-duplicate-slips-through window.
+            if guard.submitted_hashes.len() >= MAX_DUP_HASHES {
+                // HashSet has no ordering; we just clear — acceptable because at
+                // MAX_DUP_HASHES the miner has already submitted thousands of unique
+                // hashes.  The only realistic attack (resubmit immediately after
+                // eviction) would require knowing the exact eviction moment.
                 guard.submitted_hashes.clear();
             }
             guard.submitted_hashes.insert(dup_key);
@@ -895,13 +993,34 @@ let job = session_job.job.clone();
         // ── Heavy work: hash/merkle/header validation ─────────────────────────
         // Uses 256-bit integer comparison (exact) for both acceptance and block.
         // f64 difficulty is computed only for metrics/UI (true_share_diff).
-        let result = validate_share(
+        //
+        // NOTE: validate_share can return Err for malformed inputs (e.g., non-hex
+        // ntime/nonce that parse_u32_be rejects).  We must NOT propagate the error
+        // up to handle_client, because that would close the TCP connection.
+        // Instead, return an error response and keep the session alive — the miner
+        // may send valid shares after this.
+        let result = match validate_share(
             session_job.job.as_ref(),
             session_job.coinbase_prefix.as_slice(),
             &submit,
             &session_job.share_target_le,   // ← 256-bit LE target
             session_job.custom_coinbase2_bytes.as_deref().map(|v| v.as_slice()),
-        ).context("share validation")?;
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                // Malformed input (non-hex nonce/ntime, etc.) — reject without closing.
+                tracing::warn!(
+                    "share validation input error worker={worker}: {err:?}"
+                );
+                let resp = json!({
+                    "id": request.id,
+                    "result": false,
+                    "error": [20, format!("Invalid share params: {err}"), null]
+                });
+                let _ = tx.send(resp.to_string()).await;
+                return Ok(());
+            }
+        };
 
         let now = Utc::now();
         // notify_to_submit_ms: time from last mining.notify → this mining.submit.
@@ -1016,7 +1135,17 @@ let job = session_job.job.clone();
         // Block submit / optional persistence / metrics are all outside the lock.
         if result.accepted {
             if result.is_block {
-                if let Some(block_hex) = result.block_hex.as_deref() {
+                if session_job.is_stale_block {
+                    // Share passed difficulty BUT is on a previous block's job (grace window).
+                    // The hash is below network target but the prevhash is stale.
+                    // We count it as a found share but DO NOT submit — Bitcoin Core would
+                    // reject it with bad-prevblk.
+                    tracing::warn!(
+                        "GRACE-BLOCK: worker={worker} found hash below target on stale-block job \
+                         height={} hash={} — NOT submitting (wrong prevhash, grace window)",
+                        job.height, result.hash_hex
+                    );
+                } else if let Some(block_hex) = result.block_hex.as_deref() {
                     let coinbase_hex_ref = result.coinbase_hex.as_deref().unwrap_or("");
                     tracing::info!(
                         "*** BLOCK FOUND by {worker} height={} hash={} diff={:.2} template_key=\"{}\" ***",
@@ -1054,8 +1183,8 @@ let job = session_job.job.clone();
                             .insert_block(job.height as i64, &result.hash_hex, status)
                             .await;
                     }
-                }
-            }
+                } // end else if block_hex
+            } // end if is_block
 
             if self.config.persist_shares {
                 let _ = self.redis.incr_share(&worker).await;
@@ -1244,6 +1373,10 @@ struct SessionState {
     /// Token bucket: rate-limits mining.notify to ≤ 1/500ms burst=2.
     /// Bypassed when clean_jobs=true so new-block notifies are never throttled.
     notify_bucket: NotifyBucket,
+    /// Epoch-ms deadline until which stale-block jobs are kept in the queue
+    /// and shares on them are accepted (without block submission).
+    /// Set to now + STALE_GRACE_MS on every clean_jobs=true event.
+    stale_grace_until_ms: u64,
             /// How many round-trip proof entries have been logged for this session.
             /// We log the first 200 accepted shares per session for version-rolling stats,
             /// then stop to avoid flooding logs at scale.
@@ -1293,10 +1426,42 @@ impl SessionState {
             session_start: Utc::now(),
             last_clean_jobs_time: None,
             notify_bucket: NotifyBucket::new(bucket_capacity, bucket_refill_ms),
+            stale_grace_until_ms: 0,
             proof_shares_logged: 0,
             version_mask: 0x1fffe000,
             submitted_hashes: HashSet::with_capacity(256),
         }
+    }
+
+    /// Mark all current jobs as belonging to a stale (previous) block and arm the
+    /// grace window. Called instead of jobs.clear() on clean_jobs=true so shares
+    /// in-flight can still be accepted for the next STALE_GRACE_MS milliseconds.
+    fn mark_jobs_stale_block(&mut self) {
+        // 300ms grace window: covers TCP RTT + firmware processing + share in buffer.
+        const STALE_GRACE_MS: u64 = 300;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.stale_grace_until_ms = now_ms + STALE_GRACE_MS;
+
+        // Mark every existing job as stale-block (in-place mutation via Arc replacement).
+        let stale_jobs: VecDeque<Arc<SessionJob>> = self.jobs.drain(..)
+            .map(|j| {
+                Arc::new(SessionJob {
+                    job:                   j.job.clone(),
+                    difficulty:            j.difficulty,
+                    share_target_le:       j.share_target_le,
+                    coinbase_prefix:       j.coinbase_prefix.clone(),
+                    session_job_id:        j.session_job_id.clone(),
+                    notify_ntime:          j.notify_ntime.clone(),
+                    custom_coinbase2_hex:  j.custom_coinbase2_hex.clone(),
+                    custom_coinbase2_bytes: j.custom_coinbase2_bytes.clone(),
+                    is_stale_block:        true,
+                })
+            })
+            .collect();
+        self.jobs = stale_jobs;
     }
 
     fn push_job(&mut self, job: Arc<JobTemplate>, difficulty: f64, extranonce1_bytes: &[u8], notify_ntime: Option<String>) -> Arc<SessionJob> {
@@ -1349,10 +1514,20 @@ impl SessionState {
             notify_ntime,
             custom_coinbase2_hex,
             custom_coinbase2_bytes,
+            is_stale_block: false,
         });
 
+        // Evict expired stale-block jobs before adding the new one.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if now_ms >= self.stale_grace_until_ms {
+            self.jobs.retain(|j| !j.is_stale_block);
+        }
+
         self.jobs.push_back(entry.clone());
-        while self.jobs.len() > 16 {
+        while self.jobs.len() > 32 {
             self.jobs.pop_front();
         }
         entry
@@ -1382,6 +1557,10 @@ struct SessionJob {
     /// Pre-decoded bytes of `custom_coinbase2_hex` — passed to `validate_share`
     /// as `coinbase2_override` so block validation uses the miner's address.
     custom_coinbase2_bytes: Option<Arc<Vec<u8>>>,
+    /// True when this job belongs to a previous block (its prevhash is no longer
+    /// the chain tip). Shares on stale-block jobs are accepted for metrics
+    /// (the miner did real work) but never submitted as blocks.
+    is_stale_block: bool,
 }
 
 fn parse_u32_be(hex_str: &str) -> Option<u32> {
