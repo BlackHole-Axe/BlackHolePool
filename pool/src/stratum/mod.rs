@@ -1,8 +1,13 @@
 use std::collections::VecDeque;
 use std::env;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Compact duplicate-share key: (job_id_u64, nonce_u32, ntime_u32, extranonce2_u64, version_u32).
+/// Stored as a plain integer tuple in a HashSet — zero heap allocation per share.
+type DupKey = (u64, u32, u32, u64, u32);
 
 use anyhow::Context;
 use chrono::Utc;
@@ -90,12 +95,15 @@ impl StratumServer {
 
         let (tx, mut rx) = mpsc::channel::<String>(64);
         // Writer task: exits when the socket dies or all senders are dropped.
+        // Reuses a single Vec<u8> buffer to combine msg + "\n" into one write_all,
+        // reducing syscall count from 2N to N and packet count for small messages.
         tokio::spawn(async move {
+            let mut write_buf: Vec<u8> = Vec::with_capacity(512);
             while let Some(msg) = rx.recv().await {
-                if writer.write_all(msg.as_bytes()).await.is_err() {
-                    break;
-                }
-                if writer.write_all(b"\n").await.is_err() {
+                write_buf.clear();
+                write_buf.extend_from_slice(msg.as_bytes());
+                write_buf.push(b'\n');
+                if writer.write_all(&write_buf).await.is_err() {
                     break;
                 }
             }
@@ -142,59 +150,44 @@ impl StratumServer {
                     continue;
                 }
 
-                // ── Token-bucket notify gate ────────────────────────────────
-                // Check auth and determine clean_jobs with a short lock.
-                // For clean_jobs=true (new block) we bypass the bucket entirely —
-                // latency on a block change is critical.
-                // For mempool-only updates (clean_jobs=false) we consume a token;
-                // if the bucket is empty, skip this notify (the miner is already
-                // working on the latest prevhash and its nonce space is still valid).
-                let (authorized, clean_jobs_peek) = {
-                    let guard = notify_state.lock().await;
-                    let clean = guard
-                        .last_prevhash
-                        .as_deref()
-                        .map_or(true, |prev| prev != job.prevhash_le);
-                    (guard.authorized, clean)
-                };
-
-                if !authorized {
-                    continue;
-                }
-
-                // For non-block updates, check (and consume) a token.
-                // This is done outside the main lock to avoid holding it across time.
-                if !clean_jobs_peek {
-                    let token_ok = {
-                        let mut guard = notify_state.lock().await;
-                        guard.notify_bucket.try_consume()
-                    };
-                    if !token_ok {
-                        // Token bucket empty: rate-limit this mempool-only update.
-                        // The miner is already working on the latest prevhash.
-                        notify_counters.inc_notify_rate_limited();
-                        continue;
-                    }
-                }
-
+                // ── Token-bucket notify gate (single lock) ──────────────────
+                // All state reads and mutations (auth check, clean_jobs detection,
+                // bucket consume, job push) happen inside ONE lock acquisition.
+                //
+                // Previously: 3 separate locks (peek → bucket → work).
+                // Now: 1 lock — eliminates 2 redundant Mutex round-trips per notify.
+                //
+                // Safety: try_consume() is pure synchronous computation (no await),
+                // so holding the lock across it is safe.  The lock is never held
+                // across a yield point.
+                //
+                // Semantics preserved:
+                //  - clean_jobs=true bypasses the bucket (critical path, no rate limit)
+                //  - clean_jobs=false consumes a token; empty bucket → skip notify
+                //  - authorized check still gates all work
                 let notify = {
                     let mut guard = notify_state.lock().await;
+
                     if !guard.authorized {
                         continue;
                     }
 
-                    // Re-check clean_jobs inside the lock (state may have changed during await).
                     let clean_jobs = guard
                         .last_prevhash
                         .as_deref()
                         .map_or(true, |prev| prev != job.prevhash_le);
 
+                    // For mempool-only updates, check (and consume) a token.
+                    // clean_jobs=true bypasses the bucket — new-block notify must never be delayed.
+                    if !clean_jobs && !guard.notify_bucket.try_consume() {
+                        notify_counters.inc_notify_rate_limited();
+                        continue;
+                    }
+
                     if clean_jobs {
-                        // Instead of clearing old jobs immediately, mark them as
-                        // stale-block so shares arriving during the grace window
-                        // are accepted (real work) but never submitted as blocks.
+                        // Mark existing jobs stale in-place (AtomicBool, no Arc recreation).
+                        // Grace window stays active for STALE_GRACE_MS after this point.
                         guard.mark_jobs_stale_block();
-                        // Record time of last clean_jobs for stale classification.
                         guard.last_clean_jobs_time = Some(Utc::now());
                     }
                     let diff = guard.difficulty;
@@ -958,13 +951,24 @@ let job = session_job.job.clone();
         //   call will return "duplicate" from Bitcoin Core, which we treat as
         //   accepted.  No block is lost.
         //
-        // BOUND STRATEGY: We use a rotating window instead of clear() to avoid the
-        // brief window where a duplicate submitted just after the clear passes through.
-        // When the set reaches MAX_DUP_HASHES we remove the OLDEST half rather than
-        // wiping everything, preserving the most recent entries as a guard.
+        // BOUND STRATEGY: True LRU eviction via paired HashSet + VecDeque.
+        // submitted_hashes_order tracks insertion order; when full, pop_front() gives
+        // the oldest key, which is then removed from submitted_hashes.
+        // This guarantees the most-recent MAX_DUP_HASHES-1 keys always remain in the
+        // guard window — eliminating the clear()-then-duplicate-slips-through race
+        // that a full wipe would create.
         const MAX_DUP_HASHES: usize = 4096;
         let version_key = version.as_deref().unwrap_or(&job.version);
-        let dup_key = format!("{}:{}:{}:{}:{}", job_id, nonce_clean, ntime_clean, extranonce2_clean, version_key);
+        // Build a compact integer tuple key — no heap allocation.
+        // All fields are already validated hex strings; parse failures (impossible
+        // after earlier validation) fall back to 0, which is a benign collision only.
+        let dup_key: DupKey = (
+            u64::from_str_radix(&job_id, 16).unwrap_or(0),
+            u32::from_str_radix(&nonce_clean, 16).unwrap_or(0),
+            u32::from_str_radix(&ntime_clean, 16).unwrap_or(0),
+            u64::from_str_radix(&extranonce2_clean, 16).unwrap_or(0),
+            u32::from_str_radix(version_key, 16).unwrap_or(0),
+        );
         {
             let mut guard = state.lock().await;
             if guard.submitted_hashes.contains(&dup_key) {
@@ -978,16 +982,16 @@ let job = session_job.job.clone();
                 self.metrics.record_share(&worker, session_job.difficulty, 0.0, false, false, 0, 0.0, 0, 0, false).await;
                 return Ok(());
             }
-            // Rotating eviction: remove oldest half when the set is full.
-            // This avoids the clear()-then-duplicate-slips-through window.
+            // LRU eviction: remove the single oldest entry O(1) instead of clear().
+            // The guard window shrinks by exactly one entry, so all other recent keys
+            // remain protected.  No duplicate can slip through after eviction.
             if guard.submitted_hashes.len() >= MAX_DUP_HASHES {
-                // HashSet has no ordering; we just clear — acceptable because at
-                // MAX_DUP_HASHES the miner has already submitted thousands of unique
-                // hashes.  The only realistic attack (resubmit immediately after
-                // eviction) would require knowing the exact eviction moment.
-                guard.submitted_hashes.clear();
+                if let Some(oldest) = guard.submitted_hashes_order.pop_front() {
+                    guard.submitted_hashes.remove(&oldest);
+                }
             }
             guard.submitted_hashes.insert(dup_key);
+            guard.submitted_hashes_order.push_back(dup_key);
         }
 
         // ── Heavy work: hash/merkle/header validation ─────────────────────────
@@ -1044,18 +1048,116 @@ let job = session_job.job.clone();
             );
         }
 
-        // Update vardiff/session state with a short lock, and collect any outgoing messages.
+        // ── Send acknowledgment immediately ──────────────────────────────────────
+        // All decisions affecting accept/reject are already final:
+        //   • duplicate detection (HashSet check + insert, above)
+        //   • stale/job classification (find_job, above)
+        //   • version-rolling validation (above)
+        //   • validate_share result (accepted/rejected, is_block, hash)
+        //
+        // Nothing below can change result.accepted.  Sending the ACK now lets the
+        // miner pipeline the next share immediately while we do post-processing.
+        //
+        // Rejected-share debug log runs before the ACK so the log reflects the
+        // exact state at decision time (no correctness impact, just log ordering).
+        if !result.accepted {
+            if let Ok(filter) = env::var("DEBUG_WORKER") {
+                if !filter.is_empty() && worker.contains(&filter) {
+                    tracing::warn!(
+                        "reject debug worker={worker} job_id={job_id} job_diff={:.4} submit_diff={:.4} version_job={} version_submit={} version_final={} version_mask={:08x} version_outside_mask={} ntime={} nonce={} extranonce2={}",
+                        job_diff,
+                        result.difficulty,
+                        job.version,
+                        submit_version.clone().unwrap_or_else(|| "-".to_string()),
+                        version.clone().unwrap_or_else(|| "-".to_string()),
+                        version_mask,
+                        version_outside_mask,
+                        submit.ntime,
+                        submit.nonce,
+                        submit.extranonce2
+                    );
+                }
+            }
+            tracing::debug!("share rejected (worker={worker}) diff={:.2}", result.difficulty);
+        }
+
+        let ack_error = if result.accepted { serde_json::Value::Null }
+                        else { json!([23, "Low difficulty share", null]) };
+        let _ = tx.send(json!({"id": request.id, "result": result.accepted, "error": ack_error}).to_string()).await;
+
+        // ── Post-ack: block candidate (spawned — never blocks the session TCP loop) ──
+        //
+        // submit_block has up to 5 retries with delays 0+500+1000+2000+4000 ms = 7.5 s
+        // worst-case.  Keeping it inline would stall this session's TCP read loop for
+        // the full retry window, preventing the miner's next share from being processed.
+        //
+        // Safety: the ACK already reflects result.accepted (true for a block candidate).
+        // The miner's view is unchanged — it received accepted=true before and after.
+        // submit_block's success/failure does not change the ACK semantics; we always
+        // report the share as accepted because the work was real.
+        //
+        // Block candidate detection (result.is_block) and stale check
+        // (is_stale_block.load) both happen BEFORE the ACK — no decision is deferred.
+        if result.accepted && result.is_block {
+            if session_job.is_stale_block.load(Ordering::Acquire) {
+                // Hash is below network target but prevhash is stale — do NOT submit.
+                tracing::warn!(
+                    "GRACE-BLOCK: worker={worker} found hash below target on stale-block job \
+                     height={} hash={} — NOT submitting (wrong prevhash, grace window)",
+                    job.height, result.hash_hex
+                );
+            } else if result.block_hex.is_some() {
+                // All values cloned here are for the rare block path — perf is irrelevant.
+                let block_hex_owned   = result.block_hex.clone().unwrap();
+                let coinbase_hex_owned = result.coinbase_hex.clone().unwrap_or_default();
+                let block_hash        = result.hash_hex.clone();
+                let template_key      = job.template_key.clone();
+                let txid_root         = job.txid_partial_root.clone();
+                let witness           = job.witness_commitment_script.clone().unwrap_or_default();
+                let height            = job.height;
+                let persist_blocks    = self.config.persist_blocks;
+                let engine            = self.template_engine.clone();
+                let sqlite_for_block  = self.sqlite.clone();
+                tracing::info!(
+                    "*** BLOCK FOUND by {worker} height={height} hash={block_hash} \
+                     diff={:.2} template_key=\"{}\" ***",
+                    result.difficulty, job.template_key,
+                );
+                tokio::spawn(async move {
+                    let status = match engine.submit_block(
+                        &block_hex_owned, &block_hash, &template_key,
+                        &coinbase_hex_owned, &txid_root, &witness,
+                    ).await {
+                        Ok(_) => {
+                            tracing::info!("BLOCK SUBMITTED OK height={height} hash={block_hash}");
+                            "submitted"
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                "BLOCK SUBMIT FAILED height={height} hash={block_hash} — {err:?}"
+                            );
+                            "submit_failed"
+                        }
+                    };
+                    if persist_blocks {
+                        let _ = sqlite_for_block.insert_block(height as i64, &block_hash, status).await;
+                    }
+                });
+            }
+        }
+
+        // ── Post-ack: vardiff + session state ─────────────────────────────────────
+        // Must run before persist_shares (needs session_diff_after) and before
+        // outbound_msgs are sent (set_difficulty / notify follow in TCP stream order).
         let mut outbound_msgs: Vec<String> = Vec::new();
         let mut session_diff_after = 0.0f64;
         {
             let mut guard = state.lock().await;
 
             if result.accepted {
-                // Record accepted shares for vardiff timing.
                 guard.vardiff.record_share(now, job_diff);
             }
 
-            // Retarget can be triggered even without acceptance to keep behavior consistent.
             if vardiff_enabled {
                 let current_diff = guard.difficulty;
                 if let Some(new_diff) = guard.vardiff.maybe_retarget(current_diff, now) {
@@ -1082,28 +1184,23 @@ let job = session_job.job.clone();
             session_diff_after = guard.difficulty;
         }
 
-        // ── Round-trip proof logging (first 3 accepted shares per session) ─────
-        // Logs every field needed to verify SHA256d(header) == hash externally.
-        // Verification: python3 verify_share.py <job fields> → must match hash_hex.
-        if result.accepted {
-            let should_log_proof = {
+        // ── Post-ack: round-trip proof logging ───────────────────────────────────
+        // Disabled by default (SHARE_PROOF_SHARES=0).  When enabled, logs every
+        // field needed to verify SHA256d(header) == hash externally for the first
+        // N accepted shares per session.  Set SHARE_PROOF_SHARES=200 to enable.
+        // When the limit is 0 this block is entirely skipped — no lock, no formatting.
+        if result.accepted && self.config.share_proof_limit > 0 {
+            let proof_extranonce1: Option<String> = {
                 let mut guard = state.lock().await;
-                if guard.proof_shares_logged < 200 {
+                if guard.proof_shares_logged < self.config.share_proof_limit {
                     guard.proof_shares_logged += 1;
-                    true
+                    Some(guard.extranonce1.clone())
                 } else {
-                    false
+                    None
                 }
             };
-            if should_log_proof {
-                // extranonce1 is stored in SessionState; read it with a brief lock.
-                let extranonce1_for_proof = {
-                    let guard = state.lock().await;
-                    guard.extranonce1.clone()
-                };
-                // version_final: the actually-used nVersion (after rolling or job default)
-                let version_final = version.clone()
-                    .unwrap_or_else(|| job.version.clone());
+            if let Some(extranonce1_for_proof) = proof_extranonce1 {
+                let version_final = version.clone().unwrap_or_else(|| job.version.clone());
                 info!(
                     "SHARE_PROOF worker={} job_id={} \
                      extranonce1={} extranonce2={} ntime={} nonce={} version_final={} \
@@ -1111,157 +1208,83 @@ let job = session_job.job.clone();
                      prevhash_header_le={} nbits={} \
                      merkle_branches=[{}] \
                      header_hex={} hash_hex={} diff={:.2}",
-                    worker,
-                    session_job.session_job_id,
-                    extranonce1_for_proof,  // 4-byte random per-session (unique)
-                    extranonce2_clean,      // miner-chosen (extends nonce space)
-                    ntime_clean,
-                    nonce_clean,
+                    worker, session_job.session_job_id,
+                    extranonce1_for_proof, extranonce2_clean, ntime_clean, nonce_clean,
                     version_final,
-                    job.coinbase1,          // prefix: version+vin up to extranonce placeholder
-                    job.coinbase2,          // suffix: vout + locktime
-                    // prevhash_le = full byte-reversal of GBT hash = bytes 4..36 of header
-                    // (NOT word-swapped Stratum format — pool uses this directly in build_header)
-                    job.prevhash_le,
-                    job.nbits,
+                    job.coinbase1, job.coinbase2, job.prevhash_le, job.nbits,
                     job.merkle_branches.join(","),
-                    result.header_hex,      // 80B header — SHA256d(this) must == hash_hex
-                    result.hash_hex,
-                    result.difficulty,
+                    result.header_hex, result.hash_hex, result.difficulty,
                 );
             }
         }
 
-        // Block submit / optional persistence / metrics are all outside the lock.
-        if result.accepted {
-            if result.is_block {
-                if session_job.is_stale_block {
-                    // Share passed difficulty BUT is on a previous block's job (grace window).
-                    // The hash is below network target but the prevhash is stale.
-                    // We count it as a found share but DO NOT submit — Bitcoin Core would
-                    // reject it with bad-prevblk.
-                    tracing::warn!(
-                        "GRACE-BLOCK: worker={worker} found hash below target on stale-block job \
-                         height={} hash={} — NOT submitting (wrong prevhash, grace window)",
-                        job.height, result.hash_hex
-                    );
-                } else if let Some(block_hex) = result.block_hex.as_deref() {
-                    let coinbase_hex_ref = result.coinbase_hex.as_deref().unwrap_or("");
-                    tracing::info!(
-                        "*** BLOCK FOUND by {worker} height={} hash={} diff={:.2} template_key=\"{}\" ***",
-                        job.height,
-                        result.hash_hex,
-                        result.difficulty,
-                        job.template_key,
-                    );
-                    let status = match self.template_engine.submit_block(
-                        block_hex,
-                        &result.hash_hex,
-                        &job.template_key,
-                        coinbase_hex_ref,
-                        &job.txid_partial_root,
-                        job.witness_commitment_script.as_deref().unwrap_or(""),
-                    ).await {
-                        Ok(_) => {
-                            tracing::info!(
-                                "BLOCK SUBMITTED OK height={} hash={}",
-                                job.height, result.hash_hex
-                            );
-                            "submitted"
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                "BLOCK SUBMIT FAILED height={} hash={} — {err:?}",
-                                job.height, result.hash_hex
-                            );
-                            "submit_failed"
-                        }
-                    };
-                    if self.config.persist_blocks {
-                        let _ = self
-                            .sqlite
-                            .insert_block(job.height as i64, &result.hash_hex, status)
-                            .await;
-                    }
-                } // end else if block_hex
-            } // end if is_block
-
-            if self.config.persist_shares {
-                let _ = self.redis.incr_share(&worker).await;
-                let _ = self.redis.set_difficulty(&worker, session_diff_after).await;
-
-                let share = ShareRecord {
+        // ── Post-ack: persistence + metrics (spawned) ────────────────────────────
+        // Persistence (Redis/SQLite) and in-memory metrics updates have no effect on:
+        //   • the ACK already sent to the miner
+        //   • the next submit's duplicate/stale/validate decisions
+        //   • the outbound_msgs ordering through the TCP mpsc channel
+        //
+        // Spawning removes every await in these paths from the session TCP handler,
+        // allowing the handler to reach outbound_msgs and return immediately.
+        //
+        // Safety invariants:
+        //   • session_diff_after captured from the vardiff lock above (f64, Copy)
+        //   • result.accepted / is_block / difficulty are final (all Copy)
+        //   • metrics.record_share updates in-memory MinerStats atomically inside
+        //     its Arc<RwLock> — the spawn sees a consistent snapshot
+        //   • upsert_worker_best is persistence-only; in-memory best_difficulty is
+        //     updated inside record_share before this function returns
+        //   • if the pool restarts before the spawn completes, the best_difficulty
+        //     may not reach SQLite — same race existed inline (crash window unchanged)
+        //   • worker is moved into the spawn (not used after this point in the handler)
+        {
+            let metrics_s      = self.metrics.clone();
+            let redis_s        = self.redis.clone();
+            let sqlite_s       = self.sqlite.clone();
+            let persist_shares = self.config.persist_shares;
+            let accepted       = result.accepted;
+            let is_block       = result.is_block;
+            let share_diff     = result.difficulty;
+            // Build ShareRecord before spawn so Uuid is generated on the session task.
+            let share_record: Option<ShareRecord> = if accepted && persist_shares {
+                Some(ShareRecord {
                     id: Uuid::new_v4(),
                     worker: worker.clone(),
                     difficulty: job_diff,
-                    is_block: result.is_block,
+                    is_block,
                     is_accepted: true,
                     latency_ms: notify_to_submit_ms,
                     created_at: now,
-                };
-                let _ = self.sqlite.insert_share(share).await;
-            }
-
-            // Persist new best_difficulty to SQLite so it survives pool restarts.
-            // This is called very rarely (only when all-time best improves), so
-            // the DB write overhead is negligible.
-            if let Some(new_best) = self.metrics
-                .record_share(
-                    &worker, job_diff, result.difficulty, true, result.is_block,
-                    notify_to_submit_ms, submit_rtt_ms, job_age_secs, notify_delay_ms, reconnect_recent,
-                ).await
-            {
-                let _ = self.sqlite.upsert_worker_best(&worker, new_best).await;
-            }
-        } else {
-            self.metrics
-                .record_share(
-                    &worker, job_diff, result.difficulty, false, false,
-                    notify_to_submit_ms, submit_rtt_ms, job_age_secs, notify_delay_ms, reconnect_recent,
-                ).await;
+                })
+            } else {
+                None
+            };
+            tokio::spawn(async move {
+                // Optional Redis/SQLite persistence (persist_shares=true only).
+                if let Some(share) = share_record {
+                    let _ = redis_s.incr_share(&worker).await;
+                    let _ = redis_s.set_difficulty(&worker, session_diff_after).await;
+                    let _ = sqlite_s.insert_share(share).await;
+                }
+                // In-memory metrics + rare best-difficulty SQLite write.
+                if let Some(new_best) = metrics_s
+                    .record_share(
+                        &worker, job_diff, share_diff, accepted, is_block,
+                        notify_to_submit_ms, submit_rtt_ms, job_age_secs,
+                        notify_delay_ms, reconnect_recent,
+                    ).await
+                {
+                    let _ = sqlite_s.upsert_worker_best(&worker, new_best).await;
+                }
+            });
         }
 
-        // Send any queued difficulty/notify messages.
+        // ── Post-ack: vardiff notifications (set_difficulty + new job if retarget) ─
+        // Sent after the ACK intentionally: the miner receives response → set_difficulty
+        // → notify in TCP stream order (FIFO through the mpsc writer channel).
         for msg in outbound_msgs {
             let _ = tx.send(msg).await;
         }
-
-        let error = if result.accepted {
-            serde_json::Value::Null
-        } else {
-            json!([23, "Low difficulty share", null])
-        };
-
-        if !result.accepted {
-            if let Ok(filter) = env::var("DEBUG_WORKER") {
-                if !filter.is_empty() && worker.contains(&filter) {
-                    tracing::warn!(
-                        "reject debug worker={worker} job_id={job_id} job_diff={:.4} submit_diff={:.4} version_job={} version_submit={} version_final={} version_mask={:08x} version_outside_mask={} ntime={} nonce={} extranonce2={}",
-                        job_diff,
-                        result.difficulty,
-                        job.version,
-                        submit_version.clone().unwrap_or_else(|| "-".to_string()),
-                        version.clone().unwrap_or_else(|| "-".to_string()),
-                        version_mask,
-                        version_outside_mask,
-                        submit.ntime,
-                        submit.nonce,
-                        submit.extranonce2
-                    );
-                }
-            }
-            tracing::debug!(
-                "share rejected (worker={worker}) diff={:.2}",
-                result.difficulty
-            );
-        }
-
-        let response = json!({
-            "id": request.id,
-            "result": result.accepted,
-            "error": error
-        });
-        let _ = tx.send(response.to_string()).await;
 
         Ok(())
     }
@@ -1382,10 +1405,15 @@ struct SessionState {
             /// then stop to avoid flooding logs at scale.
             proof_shares_logged: u16,
     version_mask: u32,
-    /// Duplicate share detection: (job_id, nonce, ntime, extranonce2, version) per session.
+    /// Duplicate share detection: packed (job_id, nonce, ntime, extranonce2, version) integers.
     /// job_id is session-scoped so the key is unique per (session, job, hash-attempt).
-    /// Bounded to last 2048 entries to cap memory.
-    submitted_hashes: HashSet<String>,
+    /// Bounded to MAX_DUP_HASHES entries; zero heap allocation per share check.
+    submitted_hashes: HashSet<DupKey>,
+    /// Insertion-order tracker for submitted_hashes.
+    /// Enables true O(1) LRU eviction: pop_front() removes the oldest key, which is
+    /// then removed from submitted_hashes.  Eliminates the full-clear() window where
+    /// a duplicate submitted immediately after eviction would pass undetected.
+    submitted_hashes_order: VecDeque<DupKey>,
 }
 
 impl SessionState {
@@ -1430,12 +1458,16 @@ impl SessionState {
             proof_shares_logged: 0,
             version_mask: 0x1fffe000,
             submitted_hashes: HashSet::with_capacity(256),
+            submitted_hashes_order: VecDeque::with_capacity(256),
         }
     }
 
     /// Mark all current jobs as belonging to a stale (previous) block and arm the
     /// grace window. Called instead of jobs.clear() on clean_jobs=true so shares
     /// in-flight can still be accepted for the next STALE_GRACE_MS milliseconds.
+    ///
+    /// Uses AtomicBool::store instead of Arc recreation: O(N) flag sets with
+    /// zero heap allocations — critical path on every new block.
     fn mark_jobs_stale_block(&mut self) {
         // 300ms grace window: covers TCP RTT + firmware processing + share in buffer.
         const STALE_GRACE_MS: u64 = 300;
@@ -1445,23 +1477,12 @@ impl SessionState {
             .as_millis() as u64;
         self.stale_grace_until_ms = now_ms + STALE_GRACE_MS;
 
-        // Mark every existing job as stale-block (in-place mutation via Arc replacement).
-        let stale_jobs: VecDeque<Arc<SessionJob>> = self.jobs.drain(..)
-            .map(|j| {
-                Arc::new(SessionJob {
-                    job:                   j.job.clone(),
-                    difficulty:            j.difficulty,
-                    share_target_le:       j.share_target_le,
-                    coinbase_prefix:       j.coinbase_prefix.clone(),
-                    session_job_id:        j.session_job_id.clone(),
-                    notify_ntime:          j.notify_ntime.clone(),
-                    custom_coinbase2_hex:  j.custom_coinbase2_hex.clone(),
-                    custom_coinbase2_bytes: j.custom_coinbase2_bytes.clone(),
-                    is_stale_block:        true,
-                })
-            })
-            .collect();
-        self.jobs = stale_jobs;
+        // Mark every existing job stale in-place — no Arc cloning, no heap allocation.
+        // Release ordering: ensures any concurrent load(Acquire) in handle_submit sees
+        // is_stale_block=true before the block candidate submission check.
+        for job in &self.jobs {
+            job.is_stale_block.store(true, Ordering::Release);
+        }
     }
 
     fn push_job(&mut self, job: Arc<JobTemplate>, difficulty: f64, extranonce1_bytes: &[u8], notify_ntime: Option<String>) -> Arc<SessionJob> {
@@ -1514,7 +1535,7 @@ impl SessionState {
             notify_ntime,
             custom_coinbase2_hex,
             custom_coinbase2_bytes,
-            is_stale_block: false,
+            is_stale_block: AtomicBool::new(false),
         });
 
         // Evict expired stale-block jobs before adding the new one.
@@ -1523,7 +1544,7 @@ impl SessionState {
             .unwrap_or_default()
             .as_millis() as u64;
         if now_ms >= self.stale_grace_until_ms {
-            self.jobs.retain(|j| !j.is_stale_block);
+            self.jobs.retain(|j| !j.is_stale_block.load(Ordering::Relaxed));
         }
 
         self.jobs.push_back(entry.clone());
@@ -1560,7 +1581,10 @@ struct SessionJob {
     /// True when this job belongs to a previous block (its prevhash is no longer
     /// the chain tip). Shares on stale-block jobs are accepted for metrics
     /// (the miner did real work) but never submitted as blocks.
-    is_stale_block: bool,
+    /// AtomicBool allows mark_jobs_stale_block() to set this flag in-place
+    /// without recreating the Arc<SessionJob> (eliminates O(N) allocations on
+    /// every clean_jobs=true event).
+    is_stale_block: AtomicBool,
 }
 
 fn parse_u32_be(hex_str: &str) -> Option<u32> {
@@ -1573,6 +1597,10 @@ fn parse_u32_be(hex_str: &str) -> Option<u32> {
 /// a valid Bitcoin address. When `Some`, it replaces `job.coinbase2` so the
 /// miner hashes towards their own address. When `None`, uses `job.coinbase2`
 /// (pool-wide payout address).
+///
+/// Builds the JSON string directly without an intermediate serde_json Value tree,
+/// eliminating multiple heap allocations per notify. All Stratum field values are
+/// hex strings ([0-9a-f]) that require no JSON escaping, making this safe.
 fn build_notify_with_ntime(
     job_id: &str,
     job: &JobTemplate,
@@ -1581,22 +1609,35 @@ fn build_notify_with_ntime(
     custom_coinbase2: Option<&str>,
 ) -> String {
     let coinbase2 = custom_coinbase2.unwrap_or(&job.coinbase2);
-    json!({
-        "id": null,
-        "method": "mining.notify",
-        "params": [
-            job_id,
-            job.prevhash,
-            job.coinbase1,
-            coinbase2,
-            job.merkle_branches,
-            job.version,
-            job.nbits,
-            ntime,
-            clean_jobs
-        ]
-    })
-    .to_string()
+    // Estimate capacity: fixed overhead ~80 B + field sizes.
+    let cap = 80
+        + job_id.len()
+        + job.prevhash.len()
+        + job.coinbase1.len()
+        + coinbase2.len()
+        + job.version.len()
+        + job.nbits.len()
+        + ntime.len()
+        + job.merkle_branches.iter().map(|b| b.len() + 3).sum::<usize>();
+    let mut out = String::with_capacity(cap);
+    // Trace of final output:
+    // {"id":null,"method":"mining.notify","params":["job","prev","cb1","cb2",[branches],"ver","bits","ntime",true]}
+    out.push_str(r#"{"id":null,"method":"mining.notify","params":[""#);
+    out.push_str(job_id);       out.push_str(r#"",""#);   // "job_id","
+    out.push_str(&job.prevhash);out.push_str(r#"",""#);   // "prevhash","
+    out.push_str(&job.coinbase1);out.push_str(r#"",""#);  // "coinbase1","
+    out.push_str(coinbase2);    out.push_str("\",[");     // "coinbase2",[
+    for (i, branch) in job.merkle_branches.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('"'); out.push_str(branch); out.push('"');
+    }
+    out.push_str("],\"");       // ],  "version"
+    out.push_str(&job.version); out.push_str("\",\"");    // "version","nbits"
+    out.push_str(&job.nbits);   out.push_str("\",\"");    // "nbits","ntime"
+    out.push_str(ntime);        out.push('"');             // "ntime"
+    out.push(',');
+    out.push_str(if clean_jobs { "true]}" } else { "false]}" });
+    out
 }
 
 fn build_set_difficulty(diff: f64) -> String {

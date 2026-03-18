@@ -75,6 +75,10 @@ pub struct Config {
     pub persist_shares: bool,
     pub persist_blocks: bool,
 
+    /// Number of accepted shares per session for which SHARE_PROOF is logged.
+    /// Default 0 = disabled.  Set SHARE_PROOF_SHARES=200 to enable for debugging.
+    /// When 0, the logging block is skipped entirely with no lock acquisition.
+    pub share_proof_limit: u16,
 }
 
 impl Config {
@@ -218,6 +222,11 @@ impl Config {
         // Persisting blocks is cheap and usually desirable.
                 let persist_blocks = parse_bool("PERSIST_BLOCKS", true);
 
+        let share_proof_limit: u16 = env::var("SHARE_PROOF_SHARES")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .context("SHARE_PROOF_SHARES must be a number 0-65535")?;
+
         Ok(Self {
             network,
             stratum_bind,
@@ -254,6 +263,7 @@ impl Config {
 
             persist_shares,
             persist_blocks,
+            share_proof_limit,
         })
     }
 }
