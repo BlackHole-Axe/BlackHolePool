@@ -196,6 +196,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackhole-pool"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bitcoin",
+ "chrono",
+ "futures",
+ "hex",
+ "num-bigint",
+ "num-traits",
+ "rand",
+ "redis",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zmq",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2056,33 +2083,6 @@ checksum = "86f4aa3ad99f2088c990dfa82d367e19cb29268ed67c574d10d0a4bfe71f07e0"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
-]
-
-[[package]]
-name = "solo-pool"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bitcoin",
- "chrono",
- "futures",
- "hex",
- "num-bigint",
- "num-traits",
- "rand",
- "redis",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "zmq",
 ]
 
 [[package]]

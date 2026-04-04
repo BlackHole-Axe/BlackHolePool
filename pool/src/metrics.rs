@@ -10,6 +10,12 @@ const HASHES_PER_DIFF: f64 = 4_294_967_296.0;
 const MAX_EVENTS: usize = 2000;
 const SHARE_CACHE_SIZE: usize = 40;
 
+/// Seconds of inactivity after which a miner is hidden from the API/dashboard.
+/// The miner's record is kept in memory (for best_difficulty persistence) but
+/// excluded from /miners responses until the miner resubmits a share.
+/// On reconnect after this window the session stats are reset to zero.
+const MINER_INACTIVE_SECS: i64 = 300; // 5 minutes
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MinerStats {
     pub worker: String,
@@ -33,6 +39,8 @@ pub struct MinerStats {
     pub last_share_time: Option<DateTime<Utc>>,
     pub user_agent: Option<String>,
     pub session_id: Option<String>,
+    /// Wall-clock time when the miner's current session started (TCP connect).
+    pub session_start: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,6 +141,10 @@ pub struct PoolCounters {
     /// This equals the real number of new blocks seen via ZMQ — always 1 per block,
     /// regardless of how many ZMQ ports fired.
     pub zmq_blocks_detected:         AtomicU64,
+    /// Set to true once the Stratum TCP listener successfully binds and is ready
+    /// to accept connections. Used by the /blackhole/connection-status endpoint
+    /// instead of a hardcoded `true`.
+    pub stratum_ready:               std::sync::atomic::AtomicBool,
 }
 
 impl PoolCounters {
@@ -174,6 +186,8 @@ impl PoolCounters {
             StaleReason::Reconnect => self.stales_reconnect.fetch_add(1, Ordering::Relaxed),
         };
     }
+    pub fn set_stratum_ready(&self) { self.stratum_ready.store(true, Ordering::Relaxed); }
+    pub fn is_stratum_ready(&self) -> bool { self.stratum_ready.load(Ordering::Relaxed) }
     pub fn inc_zmq_tx_debounced(&self)            { self.zmq_tx_debounced.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_zmq_tx_post_block_suppressed(&self) { self.zmq_tx_post_block_suppressed.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_zmq_tx_triggered(&self)            { self.zmq_tx_triggered.fetch_add(1, Ordering::Relaxed); }
@@ -275,6 +289,7 @@ impl MetricsStore {
                 last_share_time: None,
                 user_agent: None,
                 session_id: None,
+                session_start: None,
             });
 
             stats.difficulty = target_difficulty;
@@ -345,6 +360,7 @@ impl MetricsStore {
             last_share_time: None,
             user_agent: None,
             session_id: None,
+            session_start: None,
         });
         if best_diff > stats.best_difficulty {
             stats.best_difficulty = best_diff;
@@ -373,6 +389,7 @@ impl MetricsStore {
             last_share_time: None,
             user_agent: None,
             session_id: None,
+            session_start: None,
         });
         stats.stale += 1;
         stats.last_seen = now;
@@ -386,7 +403,28 @@ impl MetricsStore {
         session_id: Option<String>,
     ) {
         let now = Utc::now();
+        let cutoff = now - Duration::seconds(MINER_INACTIVE_SECS);
         let mut guard = self.inner.write().await;
+
+        // If the miner already exists but was inactive beyond the window,
+        // reset all session stats so the dashboard starts fresh.
+        // best_difficulty is preserved (historical all-time best stays).
+        if let Some(existing) = guard.miners.get_mut(worker) {
+            if existing.last_seen < cutoff {
+                // Miner was away for > MINER_INACTIVE_SECS — full session reset.
+                existing.shares          = 0;
+                existing.rejected        = 0;
+                existing.stale           = 0;
+                existing.hashrate_gh     = 0.0;
+                existing.notify_to_submit_ms = 0.0;
+                existing.submit_rtt_ms   = 0.0;
+                existing.last_share_time = None;
+                existing.session_start   = Some(now);
+                // Also clear the share-rate window so hashrate starts fresh.
+                guard.share_samples.remove(worker);
+            }
+        }
+
         let stats = guard.miners.entry(worker.to_string()).or_insert_with(|| MinerStats {
             worker: worker.to_string(),
             difficulty,
@@ -402,6 +440,7 @@ impl MetricsStore {
             last_share_time: None,
             user_agent: None,
             session_id: None,
+            session_start: Some(now),
         });
         stats.difficulty = difficulty;
         stats.last_seen = now;
@@ -410,12 +449,21 @@ impl MetricsStore {
         }
         if session_id.is_some() {
             stats.session_id = session_id;
+            // New session detected (new session_id) → reset session start time.
+            stats.session_start = Some(now);
         }
     }
 
     pub async fn snapshot(&self) -> MetricsSnapshot {
         let guard = self.inner.read().await;
-        let miners = guard.miners.values().cloned().collect::<Vec<_>>();
+        let cutoff = Utc::now() - Duration::seconds(MINER_INACTIVE_SECS);
+        // Only return miners that have been active within MINER_INACTIVE_SECS.
+        // Inactive miners stay in the HashMap (for best_difficulty restart seeding)
+        // but are hidden from the dashboard/API until they submit a new share.
+        let miners = guard.miners.values()
+            .filter(|m| m.last_seen >= cutoff)
+            .cloned()
+            .collect::<Vec<_>>();
         let total_hashrate_gh = miners.iter().map(|m| m.hashrate_gh).sum();
         let total_shares = miners.iter().map(|m| m.shares).sum();
         let total_rejected = miners.iter().map(|m| m.rejected).sum();

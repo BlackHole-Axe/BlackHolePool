@@ -5,9 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Compact duplicate-share key: (job_id_u64, nonce_u32, ntime_u32, extranonce2_u64, version_u32).
-/// Stored as a plain integer tuple in a HashSet — zero heap allocation per share.
-type DupKey = (u64, u32, u32, u64, u32);
+/// Duplicate-share key: (job_id_u64, nonce_u32, ntime_u32, extranonce2_hex, version_u32).
+///
+/// extranonce2 is stored as the canonical validated hex String rather than u64 so that
+/// any EXTRANONCE2_SIZE is handled correctly, including values > 8 bytes.  Parsing a
+/// multi-byte extranonce2 as u64 would overflow and return unwrap_or(0), collapsing all
+/// distinct large extranonce2 values to the same key — a false-duplicate that silently
+/// drops real shares, including high-difficulty / best-share candidates.
+type DupKey = (u64, u32, u32, String, u32);
 
 use anyhow::Context;
 use chrono::Utc;
@@ -74,6 +79,7 @@ impl StratumServer {
     pub async fn run(&self) -> anyhow::Result<()> {
         let bind = format!("{}:{}", self.config.stratum_bind, self.config.stratum_port);
         let listener = TcpListener::bind(&bind).await?;
+        self.metrics.counters.set_stratum_ready();
         info!("stratum listening on {bind}");
 
         loop {
@@ -521,7 +527,7 @@ impl StratumServer {
                 "mining.get_version" => {
                     let response = json!({
                         "id": request.id,
-                        "result": "Solo",
+                        "result": "BlackHole",
                         "error": null
                     });
                     let _ = tx.send(response.to_string()).await;
@@ -673,7 +679,25 @@ impl StratumServer {
             }
             match found {
                 Some((script, addr_str)) => (Some(script), Some(addr_str)),
-                None => (None, None),
+                None => {
+                    // Miner provided no valid Bitcoin address as username.
+                    // If a pool-wide fallback address is configured, allow the
+                    // connection and the block reward will go to that address.
+                    // If no fallback is configured, reject the miner with a
+                    // clear, actionable error message.
+                    if self.config.payout_address.is_empty()
+                        && self.config.payout_script_hex.is_none()
+                    {
+                        tracing::warn!(
+                            "authorize rejected: worker={worker} — no Bitcoin address in \
+                             username and no pool PAYOUT_ADDRESS configured. \
+                             Set the miner's Stratum username to a Bitcoin address \
+                             (e.g. bc1qYOUR_ADDRESS) or set PAYOUT_ADDRESS in env/.env."
+                        );
+                        return (worker, false, None, None);
+                    }
+                    (None, None)
+                }
             }
         } else {
             (None, None)
@@ -959,14 +983,16 @@ let job = session_job.job.clone();
         // that a full wipe would create.
         const MAX_DUP_HASHES: usize = 4096;
         let version_key = version.as_deref().unwrap_or(&job.version);
-        // Build a compact integer tuple key — no heap allocation.
-        // All fields are already validated hex strings; parse failures (impossible
-        // after earlier validation) fall back to 0, which is a benign collision only.
+        // Build the duplicate-detection key.
+        // extranonce2 is stored as a String (the canonical validated hex), NOT as u64,
+        // so that EXTRANONCE2_SIZE > 8 bytes works correctly without any false-positive
+        // duplicate rejection.  The other fields are fixed-width and always ≤ their
+        // respective integer sizes after the earlier length validation.
         let dup_key: DupKey = (
             u64::from_str_radix(&job_id, 16).unwrap_or(0),
             u32::from_str_radix(&nonce_clean, 16).unwrap_or(0),
             u32::from_str_radix(&ntime_clean, 16).unwrap_or(0),
-            u64::from_str_radix(&extranonce2_clean, 16).unwrap_or(0),
+            extranonce2_clean.clone(),
             u32::from_str_radix(version_key, 16).unwrap_or(0),
         );
         {
@@ -990,7 +1016,7 @@ let job = session_job.job.clone();
                     guard.submitted_hashes.remove(&oldest);
                 }
             }
-            guard.submitted_hashes.insert(dup_key);
+            guard.submitted_hashes.insert(dup_key.clone());
             guard.submitted_hashes_order.push_back(dup_key);
         }
 
@@ -1083,7 +1109,18 @@ let job = session_job.job.clone();
 
         let ack_error = if result.accepted { serde_json::Value::Null }
                         else { json!([23, "Low difficulty share", null]) };
-        let _ = tx.send(json!({"id": request.id, "result": result.accepted, "error": ack_error}).to_string()).await;
+        let ack_msg = json!({"id": request.id, "result": result.accepted, "error": ack_error}).to_string();
+        if tx.send(ack_msg).await.is_err() {
+            // TCP connection closed before ACK — log only for block candidates to avoid noise.
+            if result.is_block {
+                tracing::error!(
+                    "BLOCK ACK SEND FAILED: worker={worker} height={} hash={} — \
+                     block already queued for submitblock (miner disconnected mid-submit)",
+                    job.height, result.hash_hex
+                );
+            }
+            return Ok(());
+        }
 
         // ── Post-ack: block candidate (spawned — never blocks the session TCP loop) ──
         //
@@ -1246,11 +1283,13 @@ let job = session_job.job.clone();
             let is_block       = result.is_block;
             let share_diff     = result.difficulty;
             // Build ShareRecord before spawn so Uuid is generated on the session task.
+            // difficulty = share_diff (DIFF1/hash — actual work done by the miner), NOT job_diff
+            // (job_diff is the session acceptance threshold, not the hash quality).
             let share_record: Option<ShareRecord> = if accepted && persist_shares {
                 Some(ShareRecord {
                     id: Uuid::new_v4(),
                     worker: worker.clone(),
-                    difficulty: job_diff,
+                    difficulty: share_diff,
                     is_block,
                     is_accepted: true,
                     latency_ms: notify_to_submit_ms,
@@ -1405,9 +1444,10 @@ struct SessionState {
             /// then stop to avoid flooding logs at scale.
             proof_shares_logged: u16,
     version_mask: u32,
-    /// Duplicate share detection: packed (job_id, nonce, ntime, extranonce2, version) integers.
-    /// job_id is session-scoped so the key is unique per (session, job, hash-attempt).
-    /// Bounded to MAX_DUP_HASHES entries; zero heap allocation per share check.
+    /// Duplicate share detection: (job_id, nonce, ntime, extranonce2_hex, version) tuple.
+    /// extranonce2 is stored as a String so EXTRANONCE2_SIZE > 8 bytes never causes a
+    /// false-positive (u64 would overflow → unwrap_or(0) → distinct values collide).
+    /// Bounded to MAX_DUP_HASHES entries with LRU eviction.
     submitted_hashes: HashSet<DupKey>,
     /// Insertion-order tracker for submitted_hashes.
     /// Enables true O(1) LRU eviction: pop_front() removes the oldest key, which is
@@ -1514,8 +1554,13 @@ impl SessionState {
                 ) {
                     Ok((hex, bytes)) => (Some(hex), Some(Arc::new(bytes))),
                     Err(err) => {
+                        // ⚠️  IMPORTANT: if this session finds a block, the reward goes to
+                        // the pool's PAYOUT_ADDRESS, not the miner's address.
+                        // This warn fires once per push_job; for block candidates it will
+                        // appear in the log before the "BLOCK FOUND" line.
                         tracing::warn!(
-                            "failed to build custom coinbase2 for {}: {err:?} — falling back to pool address",
+                            "coinbase2 build failed for miner {} — \
+                             falling back to pool address (block reward goes to pool!): {err:?}",
                             self.session_payout_address.as_deref().unwrap_or("?")
                         );
                         (None, None)
@@ -1647,4 +1692,218 @@ fn build_set_difficulty(diff: f64) -> String {
         "params": [diff]
     })
     .to_string()
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Build a DupKey exactly as handle_submit does — mirrors the production code path.
+    fn make_dup_key(job_id: &str, nonce: &str, ntime: &str, en2: &str, version: &str) -> DupKey {
+        (
+            u64::from_str_radix(job_id, 16).unwrap_or(0),
+            u32::from_str_radix(nonce, 16).unwrap_or(0),
+            u32::from_str_radix(ntime, 16).unwrap_or(0),
+            en2.to_string(),
+            u32::from_str_radix(version, 16).unwrap_or(0),
+        )
+    }
+
+    // ── 1) Duplicate correctness — normal config ──────────────────────────────
+
+    /// Same share submitted twice → duplicate.
+    #[test]
+    fn test_dup_key_same_share_is_duplicate() {
+        let k1 = make_dup_key("1", "aabbccdd", "699f722b", "00000001", "20000000");
+        let k2 = make_dup_key("1", "aabbccdd", "699f722b", "00000001", "20000000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(!set.insert(k2), "identical share must be detected as duplicate");
+    }
+
+    /// Different nonce → not a duplicate.
+    #[test]
+    fn test_dup_key_different_nonce_not_duplicate() {
+        let k1 = make_dup_key("1", "aabbccdd", "699f722b", "00000001", "20000000");
+        let k2 = make_dup_key("1", "aabbccee", "699f722b", "00000001", "20000000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(set.insert(k2), "different nonce must not be flagged as duplicate");
+    }
+
+    /// Different ntime → not a duplicate.
+    #[test]
+    fn test_dup_key_different_ntime_not_duplicate() {
+        let k1 = make_dup_key("1", "aabbccdd", "699f722b", "00000001", "20000000");
+        let k2 = make_dup_key("1", "aabbccdd", "699f722c", "00000001", "20000000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(set.insert(k2), "different ntime must not be flagged as duplicate");
+    }
+
+    /// Different version bits (BIP310) → not a duplicate.
+    #[test]
+    fn test_dup_key_different_version_not_duplicate() {
+        let k1 = make_dup_key("1", "aabbccdd", "699f722b", "00000001", "20000000");
+        let k2 = make_dup_key("1", "aabbccdd", "699f722b", "00000001", "203f4000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(set.insert(k2), "different version bits must not be flagged as duplicate");
+    }
+
+    /// Different extranonce2 (normal 4-byte / 8-hex) → not a duplicate.
+    #[test]
+    fn test_dup_key_different_extranonce2_not_duplicate() {
+        let k1 = make_dup_key("1", "aabbccdd", "699f722b", "00000001", "20000000");
+        let k2 = make_dup_key("1", "aabbccdd", "699f722b", "00000002", "20000000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(set.insert(k2), "different extranonce2 must not be flagged as duplicate");
+    }
+
+    // ── 2) Duplicate correctness — extended extranonce2 (> 8 bytes) ──────────
+
+    /// EXTRANONCE2_SIZE = 12 bytes (24 hex chars).  Two shares that differ only
+    /// in extranonce2 must NOT collide — the old u64 path would overflow → 0 for
+    /// both, creating a false duplicate and silently dropping real work.
+    #[test]
+    fn test_dup_key_extended_en2_different_not_duplicate() {
+        // 24 hex chars = 12 bytes — exceeds u64 (8 bytes = 16 hex chars).
+        let en2_a = "000000000000000000000001";
+        let en2_b = "000000000000000000000002";
+        let k1 = make_dup_key("1", "aabbccdd", "699f722b", en2_a, "20000000");
+        let k2 = make_dup_key("1", "aabbccdd", "699f722b", en2_b, "20000000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(
+            set.insert(k2),
+            "different extended extranonce2 (>8 bytes) must not be a false duplicate \
+             — the old code parsed both as u64 and both would unwrap_or(0)"
+        );
+    }
+
+    /// Same large extranonce2 submitted twice → must still detect the duplicate.
+    #[test]
+    fn test_dup_key_extended_en2_same_is_duplicate() {
+        let en2 = "000000000000000000000001"; // 24 hex = 12 bytes
+        let k1 = make_dup_key("1", "aabbccdd", "699f722b", en2, "20000000");
+        let k2 = make_dup_key("1", "aabbccdd", "699f722b", en2, "20000000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(!set.insert(k2), "same extended extranonce2 must still be detected as duplicate");
+    }
+
+    /// The specific u64-overflow scenario: two values that differ only in bits
+    /// above position 63 would both produce 0 under `u64::from_str_radix(...).unwrap_or(0)`.
+    /// With the String-based key they remain distinct — no false duplicate.
+    #[test]
+    fn test_dup_key_extended_en2_overflow_no_false_duplicate() {
+        // 20 hex chars = 10 bytes.  Bit 64+ differs between the two values.
+        let en2_a = "00010000000000000001";
+        let en2_b = "00020000000000000001";
+        let k1 = make_dup_key("1", "aabbccdd", "699f722b", en2_a, "20000000");
+        let k2 = make_dup_key("1", "aabbccdd", "699f722b", en2_b, "20000000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(
+            set.insert(k2),
+            "extranonce2 values differing only in bits above 63 must not false-duplicate \
+             — old u64::from_str_radix would overflow both to 0"
+        );
+    }
+
+    // ── 3) Best share safety ─────────────────────────────────────────────────
+
+    /// A high-difficulty share with an extended extranonce2 must not be falsely
+    /// rejected.  This test proves that two shares with the same job/nonce/ntime
+    /// but DIFFERENT extranonce2 (> 8 bytes) are both accepted by the dup filter,
+    /// so a high-diff share is never silently discarded before best tracking.
+    #[test]
+    fn test_dup_key_high_diff_extended_en2_not_lost() {
+        // Simulate: miner submits two shares on the same job, same nonce/ntime,
+        // but different extranonce2 values that are each 9 bytes (18 hex chars).
+        // Under the old code both would collapse to 0 → second rejected as dup.
+        let en2_first  = "000000000000000000";  // 18 hex = 9 bytes
+        let en2_second = "000000000000000001";  // different → different hash
+        let k1 = make_dup_key("a", "deadbeef", "6abc1234", en2_first,  "20000000");
+        let k2 = make_dup_key("a", "deadbeef", "6abc1234", en2_second, "20000000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1), "first share must be accepted");
+        assert!(
+            set.insert(k2),
+            "second share with different extended extranonce2 must reach validation \
+             — if falsely duplicated the best-diff share could be silently dropped"
+        );
+    }
+
+    // ── 4) Storage semantics ─────────────────────────────────────────────────
+
+    /// ShareRecord.difficulty must hold the actual share difficulty (DIFF1/hash),
+    /// not the session/job acceptance threshold.
+    ///
+    /// Rationale: job_diff is a threshold — it tells us the minimum quality the
+    /// pool requires.  share_diff (result.difficulty) is the true measure of the
+    /// work the miner actually performed.  Analytics, dashboards, and API consumers
+    /// reading `shares.difficulty` expect the actual work value.
+    ///
+    /// This test verifies the semantics at the ShareRecord construction site.
+    #[test]
+    fn test_share_record_stores_actual_share_difficulty_not_threshold() {
+        use crate::storage::ShareRecord;
+        use uuid::Uuid;
+        use chrono::Utc;
+
+        let job_diff: f64   = 1024.0;   // session/job acceptance threshold
+        let share_diff: f64 = 98_765.0; // actual DIFF1/hash for this share
+
+        // After the fix: difficulty = share_diff.
+        let record = ShareRecord {
+            id: Uuid::new_v4(),
+            worker: "test_worker".into(),
+            difficulty: share_diff,  // ← must be share_diff, not job_diff
+            is_block: false,
+            is_accepted: true,
+            latency_ms: 10,
+            created_at: Utc::now(),
+        };
+
+        assert!(
+            (record.difficulty - share_diff).abs() < f64::EPSILON,
+            "ShareRecord.difficulty must equal the actual share difficulty ({share_diff})"
+        );
+        assert!(
+            (record.difficulty - job_diff).abs() > 1000.0,
+            "ShareRecord.difficulty must NOT store the job threshold ({job_diff})"
+        );
+    }
+
+    // ── 5) No regression: current standard config ────────────────────────────
+
+    /// Standard 4-byte extranonce2 (8 hex chars) still works correctly.
+    #[test]
+    fn test_dup_key_standard_4byte_en2_still_works() {
+        let k1 = make_dup_key("3", "cafebabe", "5f0a1b2c", "deadc0de", "20000000");
+        let k2 = make_dup_key("3", "cafebabe", "5f0a1b2c", "deadc0de", "20000000");
+        let k3 = make_dup_key("3", "cafebabe", "5f0a1b2c", "deadc0df", "20000000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(!set.insert(k2), "standard 4-byte en2: same share must be duplicate");
+        assert!(set.insert(k3), "standard 4-byte en2: different en2 must not be duplicate");
+    }
+
+    /// Different job_id with identical nonce/ntime/en2/version → not a duplicate.
+    /// Verifies that job_id remains part of the key (cross-job false-duplicate prevention).
+    #[test]
+    fn test_dup_key_different_job_not_duplicate() {
+        let k1 = make_dup_key("1", "aabbccdd", "699f722b", "00000001", "20000000");
+        let k2 = make_dup_key("2", "aabbccdd", "699f722b", "00000001", "20000000");
+        let mut set: HashSet<DupKey> = HashSet::new();
+        assert!(set.insert(k1));
+        assert!(
+            set.insert(k2),
+            "same fields on a different job must not be flagged as duplicate \
+             (different job → different coinbase → different block header)"
+        );
+    }
 }

@@ -10,6 +10,7 @@ use serde::Serialize;
 use tracing::info;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::build_info::{self, BuildInfo};
 use crate::config::Config;
 use crate::metrics::{MetricsStore, ShareEvent};
 use crate::rpc::RpcClient;
@@ -61,6 +62,7 @@ impl ApiServer {
 
         let app = Router::new()
             .route("/health", get(health))
+            .route("/build-info", get(build_info_endpoint))
             .route("/metrics", get(metrics))
             .route("/miners", get(miners))
             .route("/shares", get(shares))
@@ -68,11 +70,11 @@ impl ApiServer {
             .route("/blocks", get(blocks))
             .route("/pool", get(pool))
             .route("/network", get(network))
-            .route("/sweetsolo/status", get(sweetsolo_status))
-            .route("/sweetsolo/miners", get(sweetsolo_miners))
-            .route("/sweetsolo/mempool", get(sweetsolo_mempool))
-            .route("/sweetsolo/connection-status", get(sweetsolo_connection_status))
-            .route("/sweetsolo/template-info", get(sweetsolo_template_info))
+            .route("/blackhole/status",            get(blackhole_status))
+            .route("/blackhole/miners",            get(blackhole_miners))
+            .route("/blackhole/mempool",           get(blackhole_mempool))
+            .route("/blackhole/connection-status", get(blackhole_connection_status))
+            .route("/blackhole/template-info",     get(blackhole_template_info))
             .with_state(state)
             .layer(cors);
 
@@ -95,7 +97,20 @@ struct ApiState {
 }
 
 async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({ "ok": true }))
+    Json(HealthResponse {
+        ok: true,
+        build: build_info::current(),
+    })
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    ok: bool,
+    build: BuildInfo,
+}
+
+async fn build_info_endpoint() -> impl IntoResponse {
+    Json(build_info::current())
 }
 
 async fn metrics(State(state): State<ApiState>) -> impl IntoResponse {
@@ -171,66 +186,40 @@ async fn blocks(State(state): State<ApiState>) -> impl IntoResponse {
 }
 
 #[derive(Serialize)]
+#[allow(non_snake_case)]
 struct PoolInfo {
     totalHashRate: f64,
     totalMiners: usize,
     blockHeight: u64,
     blocksFound: u64,
     fee: u64,
-    /// ISO-8601 UTC timestamp when the pool process started.
-    /// Use poolStartedAt to compute exact Δ windows between snapshots.
     poolStartedAt: String,
-    /// Seconds since pool start. Use as the denominator for rate calculations:
-    ///   rate/min  = counter / (uptimeSecs / 60)
-    ///   rate/hour = counter / (uptimeSecs / 3600)
     uptimeSecs: u64,
-
-    // ── Storm/health counters — ALL cumulative since pool start ──────────
-    // For threshold comparisons always use the *Per* fields (normalized) or
-    // compute Δ between two snapshots divided by Δ uptimeSecs.
     jobsSent: u64,
     cleanJobsSent: u64,
-    /// Cumulative jobsSent / connectedMiners (snapshot-time normalization).
     jobsSentPerMiner: f64,
-    /// jobsSent / (uptimeSecs/60) — average notifies per miner per minute
-    /// since pool start.  Compare against threshold ≤ 6/10min = ≤ 0.6/min.
     jobsSentPerMinerPerMin: f64,
-    // Notify suppression (three distinct reasons)
-    notifyDeduped: u64,      // same template_key from two sources
-    notifyRateLimited: u64,  // token bucket full (mempool-only floods)
-    // zmqTxSuppressed = post-block 15s window (see zmqTxSuppressed in ZMQ section)
+    notifyDeduped: u64,
+    notifyRateLimited: u64,
     duplicateShares: u64,
     reconnectsTotal: u64,
     submitblockAccepted: u64,
     submitblockRejected: u64,
     submitblockRpcFail: u64,
     versionRollingViolations: u64,
-    // Stale classification
     stalesNewBlock: u64,
     stalesExpired: u64,
     stalesReconnect: u64,
-    // ── ZMQ block activity ───────────────────────────────────────────────
-    /// Unique blocks detected via ZMQ (after 10ms debounce).
-    /// This is the real block count — always 1 per new block regardless of
-    /// how many ZMQ ports fired (hashblock:28334 + rawblock:28332 = 2 msgs/block).
     zmqBlocksDetected: u64,
-    /// Raw ZMQ block notifications received across ALL endpoints.
-    /// With dual ZMQ ports (28334 + 28332), this is ~2× zmqBlocksDetected.
-    /// Example: 1 block → zmqBlocksDetected=1, zmqBlockNotifications=2.
     zmqBlockNotifications: u64,
-    // ── ZMQ TX activity ──────────────────────────────────────────────────
     zmqTxTriggered: u64,
-    /// Suppressed by ZMQ_DEBOUNCE_MS (normal; always high — thousands/hour is fine).
     zmqTxDebounced: u64,
-    /// Suppressed by post-block suppression window (POST_BLOCK_SUPPRESS_MS).
-    /// Should correlate with zmqBlocksDetected: ~N per block × mempool burst rate.
     zmqTxPostBlockSuppressed: u64,
-    /// staleRatio = (stalesNewBlock + stalesExpired + stalesReconnect)
-    ///            / (accepted_shares + stale_shares)
-    ///
-    /// Denominator includes only accepted + stale (NOT invalid/duplicate rejections).
-    /// A value of 0.05 means 5% of submitted work was timing-discarded.
     staleRatio: f64,
+    /// Bitcoin Core current block height (from getmininginfo).
+    /// Reused to populate /network data — no second RPC call needed.
+    networkDifficulty: f64,
+    networkHashps: f64,
 }
 
 async fn pool(State(state): State<ApiState>) -> impl IntoResponse {
@@ -238,35 +227,16 @@ async fn pool(State(state): State<ApiState>) -> impl IntoResponse {
     let total_hashrate = snapshot.total_hashrate_gh * 1_000_000_000.0;
     let total_miners = snapshot.miners.len();
     let blocks_found = snapshot.total_blocks;
-    let block_height = fetch_mining_info(&state.rpc)
-        .await
-        .map(|info| info.blocks)
-        .unwrap_or(0);
+    // One call; fields are reused for networkDifficulty/networkHashps below.
+    let mining_info = fetch_mining_info(&state.rpc).await.ok();
+    let block_height = mining_info.as_ref().map(|i| i.blocks).unwrap_or(0);
     let c = &state.metrics.counters;
 
-    // ── staleRatio definition ────────────────────────────────────────────────
-    // Numerator  : total stale submissions (all three reasons combined)
-    //              = stalesNewBlock + stalesExpired + stalesReconnect
-    //              (from atomic counters, same source as the counters in this response)
-    //
-    // Denominator: total *submissions* = accepted + stale
-    //              (rejected/invalid shares are NOT included: they represent a
-    //               different failure mode — wrong hash, duplicate nonce, etc.)
-    //
-    // Result: fraction of submitted work that was discarded due to timing (stale).
-    //         staleRatio = 0.05 means 5 out of every 100 submitted shares were stale.
-    //
-    // Note: `m.shares` = accepted; `m.stale` = stale (both from MetricsStore::record_share
-    //       and record_stale, which use the same per-worker MinerStats entry).
     let total_stales_all = c.stales_new_block() + c.stales_expired() + c.stales_reconnect();
     let total_accepted: u64 = snapshot.miners.iter().map(|m| m.shares).sum();
     let total_stale_from_stats: u64 = snapshot.miners.iter().map(|m| m.stale).sum();
-    // Denominator = accepted + stale (excludes invalid/duplicate rejections)
     let total_submissions = total_accepted + total_stale_from_stats;
     let stale_ratio = if total_submissions > 0 {
-        // Use per-miner stats (total_stale_from_stats) for denominator consistency,
-        // and atomic counters (total_stales_all) for numerator to catch all reasons.
-        // Both should match; the atomic counters are the authoritative source.
         (total_stales_all as f64 / total_submissions as f64).min(1.0)
     } else {
         0.0
@@ -293,22 +263,24 @@ async fn pool(State(state): State<ApiState>) -> impl IntoResponse {
         jobsSentPerMiner:       jobs_sent_per_miner,
         jobsSentPerMinerPerMin: jobs_sent_per_miner_per_min,
         notifyDeduped:          c.notify_deduped(),
-        notifyRateLimited:  c.notify_rate_limited(),
-        duplicateShares:    c.duplicate_shares(),
-        reconnectsTotal:      c.reconnects_total(),
-        submitblockAccepted:  c.submitblock_accepted(),
-        submitblockRejected:  c.submitblock_rejected(),
-        submitblockRpcFail:   c.submitblock_rpc_fail(),
+        notifyRateLimited:      c.notify_rate_limited(),
+        duplicateShares:        c.duplicate_shares(),
+        reconnectsTotal:        c.reconnects_total(),
+        submitblockAccepted:    c.submitblock_accepted(),
+        submitblockRejected:    c.submitblock_rejected(),
+        submitblockRpcFail:     c.submitblock_rpc_fail(),
         versionRollingViolations: c.version_rolling_violations(),
-        stalesNewBlock:       c.stales_new_block(),
-        stalesExpired:        c.stales_expired(),
-        stalesReconnect:      c.stales_reconnect(),
-        zmqBlocksDetected:         c.zmq_blocks_detected(),
-        zmqBlockNotifications:     c.zmq_block_received(),
-        zmqTxTriggered:            c.zmq_tx_triggered(),
-        zmqTxDebounced:            c.zmq_tx_debounced(),
-        zmqTxPostBlockSuppressed:  c.zmq_tx_post_block_suppressed(),
-        staleRatio:           stale_ratio,
+        stalesNewBlock:         c.stales_new_block(),
+        stalesExpired:          c.stales_expired(),
+        stalesReconnect:        c.stales_reconnect(),
+        zmqBlocksDetected:          c.zmq_blocks_detected(),
+        zmqBlockNotifications:      c.zmq_block_received(),
+        zmqTxTriggered:             c.zmq_tx_triggered(),
+        zmqTxDebounced:             c.zmq_tx_debounced(),
+        zmqTxPostBlockSuppressed:   c.zmq_tx_post_block_suppressed(),
+        staleRatio:             stale_ratio,
+        networkDifficulty: mining_info.as_ref().map(|i| i.difficulty).unwrap_or(0.0),
+        networkHashps:     mining_info.as_ref().and_then(|i| i.networkhashps).unwrap_or(0.0),
     })
 }
 
@@ -325,7 +297,8 @@ async fn network(State(state): State<ApiState>) -> impl IntoResponse {
 }
 
 #[derive(Serialize)]
-struct SweetSoloStatus {
+#[allow(non_snake_case)]
+struct BlackHoleStatus {
     name: &'static str,
     poolIdentifier: String,
     network: String,
@@ -335,33 +308,35 @@ struct SweetSoloStatus {
     apiPort: u16,
     stratumPort: u16,
     templateRefreshIntervalMs: u64,
-    vardiff: SweetSoloVardiff,
+    vardiff: BlackHoleVardiff,
     uptime: DateTime<Utc>,
+    build: BuildInfo,
 }
 
 #[derive(Serialize)]
-struct SweetSoloVardiff {
+#[allow(non_snake_case)]
+struct BlackHoleVardiff {
     targetShareTimeSec: f64,
     checkIntervalSec: f64,
     minDifficulty: f64,
     maxDifficulty: f64,
 }
 
-async fn sweetsolo_status(State(state): State<ApiState>) -> impl IntoResponse {
+async fn blackhole_status(State(state): State<ApiState>) -> impl IntoResponse {
     let payout = state.config.payout_address.trim().to_string();
     let payout_configured = !payout.is_empty();
     let payout_address = if payout_configured { Some(payout) } else { None };
     let network = match state.config.network {
-        bitcoin::Network::Bitcoin => "mainnet",
-        bitcoin::Network::Testnet => "testnet",
-        bitcoin::Network::Signet => "signet",
-        bitcoin::Network::Regtest => "regtest",
+        bitcoin::Network::Bitcoin  => "mainnet",
+        bitcoin::Network::Testnet  => "testnet",
+        bitcoin::Network::Signet   => "signet",
+        bitcoin::Network::Regtest  => "regtest",
         _ => "unknown",
     }
     .to_string();
 
-    Json(SweetSoloStatus {
-        name: "Solo",
+    Json(BlackHoleStatus {
+        name: "BlackHole",
         poolIdentifier: state.config.pool_tag.clone(),
         network,
         internalPayoutMode: false,
@@ -370,25 +345,28 @@ async fn sweetsolo_status(State(state): State<ApiState>) -> impl IntoResponse {
         apiPort: state.config.api_port,
         stratumPort: state.config.stratum_port,
         templateRefreshIntervalMs: state.config.template_poll_ms,
-        vardiff: SweetSoloVardiff {
-            targetShareTimeSec: state.config.target_share_time_secs,
-            checkIntervalSec: state.config.vardiff_retarget_time_secs,
-            minDifficulty: state.config.min_difficulty,
-            maxDifficulty: state.config.max_difficulty,
+        vardiff: BlackHoleVardiff {
+            targetShareTimeSec:  state.config.target_share_time_secs,
+            checkIntervalSec:    state.config.vardiff_retarget_time_secs,
+            minDifficulty:       state.config.min_difficulty,
+            maxDifficulty:       state.config.max_difficulty,
         },
         uptime: state.started_at,
+        build: build_info::current(),
     })
 }
 
 #[derive(Serialize)]
-struct SweetSoloMinerList {
+#[allow(non_snake_case)]
+struct BlackHoleMinerList {
     address: String,
     bestDifficulty: f64,
-    workers: Vec<SweetSoloWorker>,
+    workers: Vec<BlackHoleWorker>,
 }
 
 #[derive(Serialize)]
-struct SweetSoloWorker {
+#[allow(non_snake_case)]
+struct BlackHoleWorker {
     sessionId: Option<String>,
     name: String,
     userAgent: Option<String>,
@@ -398,7 +376,7 @@ struct SweetSoloWorker {
     lastSeen: String,
 }
 
-async fn sweetsolo_miners(State(state): State<ApiState>) -> impl IntoResponse {
+async fn blackhole_miners(State(state): State<ApiState>) -> impl IntoResponse {
     let snapshot = state.metrics.snapshot().await;
     let best = snapshot
         .miners
@@ -409,30 +387,36 @@ async fn sweetsolo_miners(State(state): State<ApiState>) -> impl IntoResponse {
     let mut workers = snapshot
         .miners
         .into_iter()
-        .map(|miner| SweetSoloWorker {
-            sessionId: miner.session_id,
-            name: miner.worker,
-            userAgent: miner.user_agent,
+        .map(|miner| BlackHoleWorker {
+            sessionId:      miner.session_id,
+            name:           miner.worker,
+            userAgent:      miner.user_agent,
             bestDifficulty: miner.best_submitted_difficulty,
-            hashRate: miner.hashrate_gh * 1_000_000_000.0,
-            startTime: None,
-            lastSeen: miner.last_seen.to_rfc3339(),
+            hashRate:       miner.hashrate_gh * 1_000_000_000.0,
+            startTime:      miner.session_start.map(|t| t.to_rfc3339()),
+            lastSeen:       miner.last_seen.to_rfc3339(),
         })
         .collect::<Vec<_>>();
 
     workers.sort_by(|a, b| b.hashRate.partial_cmp(&a.hashRate).unwrap_or(std::cmp::Ordering::Equal));
 
-    Json(SweetSoloMinerList {
-        address: state.config.payout_address.clone(),
+    Json(BlackHoleMinerList {
+        address:        state.config.payout_address.clone(),
         bestDifficulty: best,
         workers,
     })
 }
 
-async fn sweetsolo_mempool(State(state): State<ApiState>) -> impl IntoResponse {
-    let result: serde_json::Value = match state.rpc.call("getmempoolinfo", serde_json::json!([])).await {
+
+
+async fn blackhole_mempool(State(state): State<ApiState>) -> impl IntoResponse {
+    let result: serde_json::Value = match state
+        .rpc
+        .call("getmempoolinfo", serde_json::json!([]))
+        .await
+    {
         Ok(val) => val,
-        Err(_) => serde_json::json!({}),
+        Err(_)  => serde_json::json!({}),
     };
     Json(result)
 }
@@ -458,13 +442,14 @@ struct StratumStatus {
 }
 
 #[derive(Serialize)]
+#[allow(non_snake_case)]
 struct ConnectionStatus {
     bitcoinRpc: RpcStatus,
     zmq: ZmqStatus,
     stratum: StratumStatus,
 }
 
-async fn sweetsolo_connection_status(State(state): State<ApiState>) -> impl IntoResponse {
+async fn blackhole_connection_status(State(state): State<ApiState>) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let connected = fetch_mining_info(&state.rpc).await.is_ok();
     let latency = if connected { Some(start.elapsed().as_millis() as u64) } else { None };
@@ -486,13 +471,14 @@ async fn sweetsolo_connection_status(State(state): State<ApiState>) -> impl Into
             },
         },
         stratum: StratumStatus {
-            port: state.config.stratum_port,
-            connected: true,
+            port:      state.config.stratum_port,
+            connected: state.metrics.counters.is_stratum_ready(),
         },
     })
 }
 
 #[derive(Serialize)]
+#[allow(non_snake_case)]
 struct TemplateInfo {
     height: u64,
     version: u32,
@@ -507,23 +493,22 @@ struct TemplateInfo {
     created_at: String,
 }
 
-async fn sweetsolo_template_info(State(state): State<ApiState>) -> impl IntoResponse {
-    // Read the last cached template from TemplateEngine — zero extra RPC calls.
+async fn blackhole_template_info(State(state): State<ApiState>) -> impl IntoResponse {
     let job: Arc<JobTemplate> = state.template_engine.subscribe().borrow().clone();
     let info = if job.ready {
         let ntime_u32 = u32::from_str_radix(job.ntime.trim_start_matches("0x"), 16).unwrap_or(0);
         Some(TemplateInfo {
-            height: job.height,
-            version: job.version_u32,
-            bits: job.nbits.clone(),
+            height:            job.height,
+            version:           job.version_u32,
+            bits:              job.nbits.clone(),
             previousblockhash: job.prevhash_le.clone(),
-            coinbasevalue: job.coinbase_value,
-            mintime: job.mintime_u32 as u64,
-            curtime: ntime_u32 as u64,
-            transactions: job.transactions.len(),
-            target: job.target.clone(),
-            job_id: job.job_id.clone(),
-            created_at: job.created_at.to_rfc3339(),
+            coinbasevalue:     job.coinbase_value,
+            mintime:           job.mintime_u32 as u64,
+            curtime:           ntime_u32 as u64,
+            transactions:      job.transactions.len(),
+            target:            job.target.clone(),
+            job_id:            job.job_id.clone(),
+            created_at:        job.created_at.to_rfc3339(),
         })
     } else {
         None

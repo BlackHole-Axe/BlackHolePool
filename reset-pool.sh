@@ -1,6 +1,6 @@
 #!/bin/bash
 # reset-pool.sh — wipe the pool database and restart all services
-# Run from the SoloPool directory: bash reset-pool.sh
+# Run from the BlackHole directory: bash reset-pool.sh
 set -e
 
 COMPOSE_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -17,7 +17,7 @@ echo "Database    : $DB_PATH"
 echo ""
 
 echo "[1/3] Stopping pool..."
-cd "$COMPOSE_DIR" && docker compose stop pool
+cd "$COMPOSE_DIR" && docker compose stop blackhole-pool
 
 echo "[2/3] Clearing database..."
 if [ -f "$DB_PATH" ]; then
@@ -35,11 +35,11 @@ else
 fi
 
 echo "[3/3] Starting pool + dashboard..."
-docker compose up -d pool dashboard
+docker compose up -d blackhole-pool blackhole-dashboard
 
 sleep 5
 echo ""
 echo "=== Pool logs ==="
-docker compose logs --tail=15 pool 2>&1 | grep -E "INFO|WARN|ERROR" | head -10
+docker compose logs --tail=15 blackhole-pool 2>&1 | grep -E "INFO|WARN|ERROR" | head -10
 echo ""
 echo "Done."

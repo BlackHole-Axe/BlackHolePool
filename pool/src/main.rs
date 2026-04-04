@@ -1,4 +1,5 @@
 mod api;
+mod build_info;
 mod config;
 mod hash;
 mod metrics;
@@ -24,22 +25,61 @@ use crate::template::TemplateEngine;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    eprintln!("solo-pool booting");
+    eprintln!("blackhole-pool booting");
+    eprintln!("build info: {}", crate::build_info::one_line());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     if let Err(err) = run().await {
-        eprintln!("solo-pool fatal: {err:?}");
+        eprintln!("blackhole-pool fatal: {err:?}");
         return Err(err);
     }
 
-    eprintln!("solo-pool exited cleanly");
+    eprintln!("blackhole-pool exited cleanly");
     Ok(())
 }
 
 async fn run() -> anyhow::Result<()> {
     let config = Config::from_env().context("load config")?;
+
+    // ── Payout address info ───────────────────────────────────────────────────
+    if config.payout_address.is_empty() && config.payout_script_hex.is_none() {
+        eprintln!(
+            "INFO: PAYOUT_ADDRESS is not set — per-miner mode active. \
+             Every miner MUST use a Bitcoin address as their Stratum username. \
+             Miners without a valid address will be rejected at authorization."
+        );
+    } else if !config.payout_address.is_empty() {
+        eprintln!(
+            "INFO: PAYOUT_ADDRESS={} — used as fallback for miners without \
+             a Bitcoin address in their username.",
+            config.payout_address
+        );
+    }
+
+    // ── Security guard: AUTH_TOKEN ────────────────────────────────────────────
+    // Emit a prominent warning (or hard-fail) when AUTH_TOKEN is empty and the
+    // stratum is reachable from the network.  Mining correctness is unaffected.
+    if config.auth_token.is_none() {
+        let open_bind = config.stratum_bind == "0.0.0.0" || config.stratum_bind == "::";
+        if config.require_auth_token {
+            anyhow::bail!(
+                "REQUIRE_AUTH_TOKEN=true but AUTH_TOKEN is not set — refusing to start. \
+                 Set AUTH_TOKEN in env/.env or set REQUIRE_AUTH_TOKEN=false to allow \
+                 unauthenticated miners."
+            );
+        } else if open_bind {
+            eprintln!(
+                "WARNING: AUTH_TOKEN is not set and stratum is bound to {} — \
+                 any device on your network can connect and mine. \
+                 Set AUTH_TOKEN in env/.env to restrict access, or set \
+                 REQUIRE_AUTH_TOKEN=true to enforce it at startup.",
+                config.stratum_bind
+            );
+        }
+    }
+
     let metrics = MetricsStore::new();
 
     

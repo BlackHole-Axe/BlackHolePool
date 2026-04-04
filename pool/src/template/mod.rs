@@ -563,7 +563,9 @@ impl TemplateEngine {
                             if engine.should_fire_block_zmq_trigger() {
                                 engine.counters.inc_zmq_blocks_detected();
                                 tokio::spawn(async move {
-                                    let _ = engine.refresh_template().await;
+                                    if let Err(e) = engine.refresh_template().await {
+                                        warn!("ZMQ block-miss refresh failed: {e:?} — longpoll will recover");
+                                    }
                                 });
                             }
                         } else {
@@ -587,7 +589,9 @@ impl TemplateEngine {
                             // A unique new block passed the debounce — count it once.
                             engine.counters.inc_zmq_blocks_detected();
                             tokio::spawn(async move {
-                                let _ = engine.refresh_template().await;
+                                if let Err(e) = engine.refresh_template().await {
+                                    warn!("ZMQ block refresh failed: {e:?} — longpoll will recover");
+                                }
                             });
                         }
                     }
@@ -655,7 +659,9 @@ impl TemplateEngine {
                         TxAction::Fire => {
                             engine.counters.inc_zmq_tx_triggered();
                             tokio::spawn(async move {
-                                let _ = engine.refresh_template().await;
+                                if let Err(e) = engine.refresh_template().await {
+                                    warn!("ZMQ tx refresh failed: {e:?} — longpoll will recover");
+                                }
                             });
                         }
                         TxAction::Debounced => {
@@ -936,13 +942,23 @@ impl TemplateEngine {
         witness_commitment_hex: Option<&str>,
     ) -> anyhow::Result<(String, String, Vec<u8>, bool)> {
         let script_pubkey = if let Some(script_hex) = &self.config.payout_script_hex {
+            // Explicit raw script — highest priority.
             hex::decode(script_hex).context("decode payout script")?
-        } else {
+        } else if !self.config.payout_address.is_empty() {
+            // Fallback address configured — parse and use.
             let address = Address::from_str(&self.config.payout_address)
                 .context("parse payout address")?
                 .require_network(self.config.network)
                 .context("payout address network mismatch")?;
             address.script_pubkey().as_bytes().to_vec()
+        } else {
+            // No pool-wide payout address set.
+            // Every miner MUST provide their own Bitcoin address as Stratum username.
+            // This OP_RETURN placeholder is used only in the base template; it is
+            // always overridden by build_coinbase2_for_payout() for each miner session
+            // that has a valid per-miner address.  A miner without an address will be
+            // rejected in handle_authorize() before any job is sent.
+            vec![0x6a] // OP_RETURN (provably unspendable — never reaches a real block)
         };
 
         let mut script_sig = Vec::new();

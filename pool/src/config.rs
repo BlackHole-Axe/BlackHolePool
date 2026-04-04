@@ -68,6 +68,11 @@ pub struct Config {
     /// After the window expires, ONE refresh captures all accumulated high-fee txs.
     pub post_block_suppress_ms: u64,
     pub auth_token: Option<String>,
+    /// If true, the pool refuses to start when AUTH_TOKEN is not set.
+    /// Useful when the stratum port is bound to 0.0.0.0 and the operator
+    /// wants to guarantee that no unauthenticated miner can connect.
+    /// Default: false (allows empty token for local-only setups).
+    pub require_auth_token: bool,
     pub redis_url: Option<String>,
     pub database_url: Option<String>,
 
@@ -133,18 +138,17 @@ impl Config {
             .unwrap_or_default();
 
         // Payout settings:
-        // - If PAYOUT_SCRIPT_HEX is provided, it overrides PAYOUT_ADDRESS.
-        // - Otherwise PAYOUT_ADDRESS is required.
+        // - If PAYOUT_SCRIPT_HEX is provided it overrides PAYOUT_ADDRESS entirely.
+        // - PAYOUT_ADDRESS is the FALLBACK used only when a miner's Stratum username
+        //   is NOT a valid Bitcoin address.
+        // - It is OPTIONAL: if empty, the pool requires every miner to set their
+        //   Bitcoin address as the Stratum username.  Any miner connecting without
+        //   a valid address will be rejected with a clear error.
         let payout_script_hex = opt_trimmed("PAYOUT_SCRIPT_HEX");
-        let payout_address = if payout_script_hex.is_some() {
-            // Address is ignored when a raw script is provided; keep it optional.
-            env::var("PAYOUT_ADDRESS").unwrap_or_default()
-        } else {
-            env::var("PAYOUT_ADDRESS").context("PAYOUT_ADDRESS is required (or set PAYOUT_SCRIPT_HEX)")?
-        };
+        let payout_address = env::var("PAYOUT_ADDRESS").unwrap_or_default();
 
-        let pool_tag = env::var("POOL_TAG").unwrap_or_else(|_| "Solo".to_string());
-        let coinbase_message = env::var("COINBASE_MESSAGE").unwrap_or_else(|_| "Solo".to_string());
+        let pool_tag = env::var("POOL_TAG").unwrap_or_else(|_| "BlackHole".to_string());
+        let coinbase_message = env::var("COINBASE_MESSAGE").unwrap_or_else(|_| "BlackHole".to_string());
 
         let extranonce1_size = env::var("EXTRANONCE1_SIZE")
             .unwrap_or_else(|_| "4".to_string())
@@ -213,6 +217,7 @@ impl Config {
                     Some(trimmed)
                 }
             });
+        let require_auth_token = parse_bool("REQUIRE_AUTH_TOKEN", false);
                 let redis_url = opt_trimmed("REDIS_URL");
         let database_url = opt_trimmed("DATABASE_URL");
 
@@ -258,6 +263,7 @@ impl Config {
             zmq_debounce_ms,
             post_block_suppress_ms,
             auth_token,
+            require_auth_token,
             redis_url,
             database_url,
 
