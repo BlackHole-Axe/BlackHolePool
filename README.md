@@ -29,8 +29,8 @@ Zero fee — 100% of every block reward goes directly to the miner's own address
 ### Umbrel Home
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/BlackHole.git
-cd BlackHole
+git clone https://github.com/BlackHole-Axe/BlackHolePool.git
+cd BlackHolePool
 bash setup-blackhole.sh
 ```
 
@@ -40,8 +40,8 @@ and ZMQ settings, writes `env/.env`, builds, and starts everything.
 ### Standard Linux / macOS (any Bitcoin Core node)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/BlackHole.git
-cd BlackHole
+git clone https://github.com/BlackHole-Axe/BlackHolePool.git
+cd BlackHolePool
 bash setup-blackhole.sh
 ```
 
@@ -81,8 +81,8 @@ bash setup-blackhole.sh --unattended
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/BlackHole.git
-cd BlackHole
+git clone https://github.com/BlackHole-Axe/BlackHolePool.git
+cd BlackHolePool
 ```
 
 ### 2. Create your config file
