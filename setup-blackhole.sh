@@ -71,18 +71,30 @@ need_cmd docker
 need_cmd curl
 
 # Docker Compose (v2 plugin preferred, v1 fallback)
-if docker compose version &>/dev/null 2>&1; then
+# We test by actually running a compose command, not just checking 'version'.
+DC=""
+if docker compose ls &>/dev/null 2>&1; then
   DC="docker compose"
 elif command -v docker-compose &>/dev/null 2>&1; then
   DC="docker-compose"
-else
+fi
+
+if [ -z "$DC" ]; then
   err "Docker Compose not found."
-  err "Install: https://docs.docker.com/compose/install/"
+  err "Install Docker Desktop or the compose plugin:"
+  err "  https://docs.docker.com/compose/install/"
+  err ""
+  err "On macOS with Homebrew:"
+  err "  brew install docker-compose  (v1)"
+  err "  OR install Docker Desktop (includes v2 plugin)"
   exit 1
 fi
 
+_DC_VER=$($DC version --short 2>/dev/null \
+         || $DC version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 \
+         || echo "unknown")
 ok "Docker:  $(docker --version | cut -d' ' -f3 | tr -d ',')"
-ok "Compose: $($DC version --short 2>/dev/null || $DC version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+ok "Compose: $_DC_VER  ($DC)"
 
 # ════════════════════════════════════════════════════════════════════════════
 # PHASE 2 — Environment Detection
@@ -105,7 +117,7 @@ DOCKER_NETWORK="blackhole_net"
 NETWORK_EXTERNAL=false
 VOLUME_EXTERNAL=false
 VOLUME_NAME="blackhole_pool_data"
-COMPOSE_FILES="-f docker-compose.yml -f docker-compose.standalone.yml"
+COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.standalone.yml)
 
 # ── Umbrel detection ─────────────────────────────────────────────────────────
 if [ -f "/home/umbrel/umbrel/umbrel.yaml" ] || \
@@ -115,7 +127,7 @@ if [ -f "/home/umbrel/umbrel/umbrel.yaml" ] || \
   DOCKER_NETWORK="umbrel_main_network"
   NETWORK_EXTERNAL=true
   VOLUME_EXTERNAL=true
-  COMPOSE_FILES="-f docker-compose.yml"
+  COMPOSE_FILES=(-f docker-compose.yml)
   ok "Platform: Umbrel Home"
 else
   ok "Platform: Standalone (Linux/macOS)"
@@ -370,18 +382,11 @@ else
   done
 fi
 
-# ── Build ZMQ URLs if not yet discovered ────────────────────────────────────
-[ -z "$ZMQ_BLOCKS_URL" ] && ZMQ_BLOCKS_URL="tcp://${BTC_IP}:${ZMQ_BLOCK_PORT}"
-[ -z "$ZMQ_TXS_URL"    ] && ZMQ_TXS_URL="tcp://${BTC_IP}:${ZMQ_TX_PORT}"
-# Secondary ZMQ endpoints (rawblock / rawtx)
-ZMQ_BLOCKS_URL2="${ZMQ_BLOCKS_URL2:-tcp://${BTC_IP}:${ZMQ_RAWBLOCK_PORT:-28332}}"
-ZMQ_TXS_URL2="${ZMQ_TXS_URL2:-tcp://${BTC_IP}:${ZMQ_RAWTX_PORT:-28333}}"
-
 # ── Interactive fallback (only if auto-detection completely failed) ───────────
 if [ -z "$BTC_IP" ]; then
   warn "Could not auto-detect Bitcoin Core."
-  if $UNATTENDED; then err "Set BTC node details in env/.env manually."; BTC_IP="127.0.0.1"; fi
-  ask "Bitcoin Core IP/hostname:"; read -r BTC_IP
+  if $UNATTENDED; then err "Set BTC node details in env/.env manually."; BTC_IP="127.0.0.1";
+  else ask "Bitcoin Core IP/hostname:"; read -r BTC_IP; fi
 fi
 if [ -z "$BTC_USER" ]; then
   if $UNATTENDED; then BTC_USER="bitcoin";
@@ -391,6 +396,13 @@ if [ -z "$BTC_PASS" ]; then
   if $UNATTENDED; then BTC_PASS="CHANGE_ME_IN_ENV";
   else ask "RPC password (hidden):"; read -r -s BTC_PASS; echo ""; fi
 fi
+
+# ── Build ZMQ URLs AFTER we have BTC_IP (including user input above) ─────────
+[ -z "$ZMQ_BLOCKS_URL" ] && ZMQ_BLOCKS_URL="tcp://${BTC_IP}:${ZMQ_BLOCK_PORT}"
+[ -z "$ZMQ_TXS_URL"    ] && ZMQ_TXS_URL="tcp://${BTC_IP}:${ZMQ_TX_PORT}"
+# Secondary ZMQ endpoints (rawblock / rawtx)
+ZMQ_BLOCKS_URL2="${ZMQ_BLOCKS_URL2:-tcp://${BTC_IP}:${ZMQ_RAWBLOCK_PORT:-28332}}"
+ZMQ_TXS_URL2="${ZMQ_TXS_URL2:-tcp://${BTC_IP}:${ZMQ_RAWTX_PORT:-28333}}"
 
 RPC_URL="http://${BTC_IP}:${BTC_PORT}"
 echo ""
@@ -626,7 +638,7 @@ networks:
     external: true
     name: ${BTC_DOCKER_NET}
 NETEOF
-    COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.network-override.yml"
+    COMPOSE_FILES+=(-f docker-compose.network-override.yml)
     ok "Pool will join Bitcoin Core network: ${BLD}$BTC_DOCKER_NET${RST}"
   fi
 
@@ -657,18 +669,11 @@ BUILD_ARGS=(
   "BUILD_TIME_UTC=$BUILD_TIME"
 )
 
-build_env=""
-for a in "${BUILD_ARGS[@]}"; do
-  build_env="$build_env $a"
-done
-
 info "Building pool image (this may take a few minutes on first run)…"
-# shellcheck disable=SC2086
-env $build_env $DC $COMPOSE_FILES build blackhole-pool 2>&1
+env "${BUILD_ARGS[@]}" "${DC[@]}" "${COMPOSE_FILES[@]}" build blackhole-pool
 
 info "Building dashboard image…"
-# shellcheck disable=SC2086
-env $build_env $DC $COMPOSE_FILES build blackhole-dashboard 2>&1
+env "${BUILD_ARGS[@]}" "${DC[@]}" "${COMPOSE_FILES[@]}" build blackhole-dashboard
 
 ok "Build complete"
 
@@ -680,13 +685,12 @@ sep; info "Phase 10 — Starting BlackHole"
 IMAGE_ID=$(docker image inspect blackhole-blackhole-pool:latest \
   --format '{{.Id}}' 2>/dev/null || echo unknown)
 
-env \
-  BUILD_GIT_SHA="$BUILD_SHA" BUILD_GIT_DIRTY="$BUILD_DIRTY" \
-  BUILD_SOURCE="setup-blackhole.sh" BUILD_TIME_UTC="$BUILD_TIME" \
-  RUNTIME_IMAGE_ID="$IMAGE_ID" \
-  RUNTIME_IMAGE_REF="blackhole-blackhole-pool:latest" \
-  RUNTIME_CONTAINER_NAME="blackhole-blackhole-pool-1" \
-  $DC $COMPOSE_FILES up -d --remove-orphans
+( export BUILD_GIT_SHA="$BUILD_SHA" BUILD_GIT_DIRTY="$BUILD_DIRTY" \
+         BUILD_SOURCE="setup-blackhole.sh" BUILD_TIME_UTC="$BUILD_TIME" \
+         RUNTIME_IMAGE_ID="$IMAGE_ID" \
+         RUNTIME_IMAGE_REF="blackhole-blackhole-pool:latest" \
+         RUNTIME_CONTAINER_NAME="blackhole-blackhole-pool-1"; \
+  $DC $COMPOSE_FILES up -d --remove-orphans )
 
 ok "Containers started"
 

@@ -1,8 +1,9 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import {
-  PoolStats, Miner, NetworkInfo, BlockRow,
-  fetchPool, fetchMiners, fetchNetwork, fetchBlocks,
+  PoolStats, Miner, NetworkInfo, BlockRow, TemplateInfo,
+  fetchPool, fetchMiners, fetchTemplateInfo,
   fmtHr, fmtDiff, fmtNetHash, fmtUptime, fmtBlockInterval, timeAgo, shortWorker, shortAddress, getFirmwareLabel,
+  blockSubsidy, fmtBtc,
 } from "./api";
 import "./styles.css";
 
@@ -719,17 +720,29 @@ function Header({ live }: { live: boolean }) {
 // ─── Hero ─────────────────────────────────────────────────────────────────────
 
 function Hero({
-  pool, miners, network, live,
+  pool, miners, network, live, templateInfo,
 }: {
   pool: PoolStats | null;
   miners: Miner[];
   network: NetworkInfo | null;
   live: boolean;
+  templateInfo: TemplateInfo | null;
 }) {
-  const bestDiff   = miners.reduce((mx, m) => Math.max(mx, m.best_submitted_difficulty ?? 0), 0);
-  const poolHr     = (pool?.totalHashRate ?? 0);
-  const netHr      = network?.networkhashps ?? 0;
-  const sharePct   = netHr > 0 ? (poolHr / netHr * 100) : 0;
+  const bestDiff    = miners.reduce((mx, m) => Math.max(mx, m.best_submitted_difficulty ?? 0), 0);
+  const poolHr      = (pool?.totalHashRate ?? 0);
+  const networkDiff = network?.difficulty ?? 0;
+
+  // ── BEST SHARE: % of network difficulty (how close to a block) ───────────
+  const bestDiffPct = networkDiff > 0 && bestDiff > 0
+    ? (bestDiff / networkDiff * 100)
+    : 0;
+
+  // ── BLOCK REWARD: subsidy + fees from live template ───────────────────────
+  const coinbaseVal  = templateInfo?.coinbasevalue ?? 0;           // satoshis
+  const height       = templateInfo?.height ?? pool?.blockHeight ?? 0;
+  const subsidy      = blockSubsidy(height);                       // satoshis
+  const fees         = coinbaseVal > 0 ? Math.max(0, coinbaseVal - subsidy) : 0;
+  const txCount      = templateInfo?.transactions ?? 0;
 
   const stats = [
     {
@@ -753,8 +766,20 @@ function Hero({
     {
       label: "BEST SHARE",
       value: bestDiff > 0 ? fmtDiff(bestDiff) : "—",
-      sub:   sharePct > 0 ? `${sharePct.toFixed(7)}% of net` : "awaiting…",
+      // ✅ Fixed: show % of network difficulty, not pool hashrate %
+      sub:   bestDiffPct > 0
+        ? `${bestDiffPct.toFixed(4)}% of network diff`
+        : "awaiting…",
       color: "var(--yellow)",
+    },
+    {
+      label: "BLOCK REWARD",
+      // Live subsidy + fees from current mempool template
+      value: coinbaseVal > 0 ? fmtBtc(coinbaseVal) : "—",
+      sub:   fees > 0
+        ? `+${fmtBtc(fees)} fees · ${txCount.toLocaleString()} txs`
+        : subsidy > 0 ? `${fmtBtc(subsidy)} subsidy` : "loading…",
+      color: "var(--green)",
     },
     {
       label: "NODE STATUS",
@@ -1047,6 +1072,8 @@ export default function App() {
   const [network, setNetwork] = useState<NetworkInfo | null>(null);
   const [live, setLive] = useState(false);
   const [celebrating, setCelebrating] = useState(false);
+  const [templateInfo, setTemplateInfo] = useState<TemplateInfo | null>(null);
+
   const prevBlocksFound    = useRef<number>(0);
   const prevSubmitAccepted = useRef<number>(0);
   // Set to true after the first successful /pool load so we don't
@@ -1066,9 +1093,10 @@ export default function App() {
       // getmininginfo RPC.
       // [Fix 3] Use allSettled so a flaky /miners response does NOT flip
       // the dashboard OFFLINE; pool health drives the LIVE indicator.
-      const [poolResult, minersResult] = await Promise.allSettled([
+      const [poolResult, minersResult, templateResult] = await Promise.allSettled([
         fetchPool(),
         fetchMiners(),
+        fetchTemplateInfo(),
       ]);
 
       if (poolResult.status === "fulfilled") {
@@ -1109,6 +1137,10 @@ export default function App() {
       if (minersResult.status === "fulfilled") {
         setMiners(minersResult.value);
       }
+
+      if (templateResult.status === "fulfilled" && templateResult.value) {
+        setTemplateInfo(templateResult.value);
+      }
     } finally {
       // [Fix 2] Always release the guard, even on errors.
       loadingRef.current = false;
@@ -1131,7 +1163,7 @@ export default function App() {
       )}
 
       <Header live={live} />
-      <Hero pool={pool} miners={miners} network={network} live={live} />
+      <Hero pool={pool} miners={miners} network={network} live={live} templateInfo={templateInfo} />
 
       {/* Row 1: Bitcoin Core | Core Visual | Share Flow */}
       <div className="bh-section-title" id="bh-core">

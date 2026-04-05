@@ -77,6 +77,16 @@ export type NetworkInfo = {
   networkhashps: number;
 };
 
+export type TemplateInfo = {
+  height: number;
+  coinbasevalue: number;   // satoshis (subsidy + fees)
+  transactions: number;
+  bits: string;
+  target: string;
+  job_id: string;
+  created_at: string;
+};
+
 // ─── URL resolution ───────────────────────────────────────────────────────────
 
 const configuredBase = (import.meta.env.VITE_API_BASE ?? "").trim();
@@ -124,6 +134,26 @@ async function apiGetAll<T>(path: string): Promise<T[]> {
 // ─── API fetch functions ───────────────────────────────────────────────────────
 
 export const fetchPool = (): Promise<PoolStats> => apiGet<PoolStats>("/pool");
+
+export const fetchTemplateInfo = async (): Promise<TemplateInfo | null> => {
+  try {
+    return await apiGet<TemplateInfo>("/blackhole/template-info");
+  } catch {
+    return null;
+  }
+};
+
+/** Bitcoin block subsidy in satoshis for a given height. */
+export function blockSubsidy(height: number): number {
+  const halvings = Math.floor(height / 210_000);
+  if (halvings >= 64) return 0;
+  return Math.floor(50 * 1e8 / Math.pow(2, halvings));
+}
+
+/** Format satoshis → "X.XXXX BTC" */
+export function fmtBtc(sat: number): string {
+  return `${(sat / 1e8).toFixed(4)} BTC`;
+}
 
 export const fetchMiners = (): Promise<Miner[]> => apiGet<Miner[]>("/miners");
 

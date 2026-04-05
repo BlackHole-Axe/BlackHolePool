@@ -438,7 +438,7 @@ body::before {
   grid-column: 1 / -1;
   grid-row: 2;
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
@@ -504,6 +504,7 @@ body::before {
     grid-template-columns: repeat(3, 1fr);
   }
   .bh-hero-stat:nth-child(3) { border-right: none; }
+  .bh-hero-stat:nth-child(6) { border-right: none; }
   .bh-hero-stat:nth-child(n+4) { border-top: 1px solid var(--border); }
 }
 
@@ -512,6 +513,7 @@ body::before {
   .bh-hero-stat { border-right: 1px solid var(--border) !important; border-top: none !important; }
   .bh-hero-stat:nth-child(even) { border-right: none !important; }
   .bh-hero-stat:nth-child(n+3) { border-top: 1px solid var(--border) !important; }
+  .bh-hero-stat:nth-child(6) { border-right: none !important; }
 }
 
 /* ─── Network bar ────────────────────────────────────────────────────────────── */
