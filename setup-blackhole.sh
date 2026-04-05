@@ -71,15 +71,16 @@ need_cmd docker
 need_cmd curl
 
 # Docker Compose (v2 plugin preferred, v1 fallback)
-# We test by actually running a compose command, not just checking 'version'.
-DC=""
-if docker compose ls &>/dev/null 2>&1; then
-  DC="docker compose"
-elif command -v docker-compose &>/dev/null 2>&1; then
-  DC="docker-compose"
+# Detect by executing `version`, because some environments fail `docker compose ls`
+# even when Compose itself is installed and working.
+DC=()
+if docker compose version >/dev/null 2>&1; then
+  DC=(docker compose)
+elif docker-compose version >/dev/null 2>&1; then
+  DC=(docker-compose)
 fi
 
-if [ -z "$DC" ]; then
+if [ ${#DC[@]} -eq 0 ]; then
   err "Docker Compose not found."
   err "Install Docker Desktop or the compose plugin:"
   err "  https://docs.docker.com/compose/install/"
@@ -670,10 +671,10 @@ BUILD_ARGS=(
 )
 
 info "Building pool image (this may take a few minutes on first run)…"
-env "${BUILD_ARGS[@]}" "${DC[@]}" "${COMPOSE_FILES[@]}" build blackhole-pool
+env "${BUILD_ARGS[@]}" "${DC[@]}" "${COMPOSE_FILES[@]}" build blackhole-pool 2>&1
 
 info "Building dashboard image…"
-env "${BUILD_ARGS[@]}" "${DC[@]}" "${COMPOSE_FILES[@]}" build blackhole-dashboard
+env "${BUILD_ARGS[@]}" "${DC[@]}" "${COMPOSE_FILES[@]}" build blackhole-dashboard 2>&1
 
 ok "Build complete"
 
